@@ -55,10 +55,10 @@ const loginLimiter = rateLimit({
     max: 10,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => {
+    keyGenerator: (req, res) => {
         // IP + email/identifier kombinasyonu → daha hassas hedefleme
         const id = (req.body?.identifier || req.body?.email || req.body?.username || '').toLowerCase().trim().slice(0, 50);
-        return (req.ip || '').replace(/^::ffff:/, '') + ':' + id;
+        return rateLimit.ipKeyGenerator(req, res) + ':' + id;
     },
     message: { error: 'Çok fazla giriş denemesi. Lütfen 15 dakika sonra tekrar deneyin.' },
     skip: (req) => process.env.NODE_ENV === 'test',
@@ -69,7 +69,7 @@ const registerLimiter = rateLimit({
     max: 5,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => (req.ip || '').replace(/^::ffff:/, ''),
+    keyGenerator: (req, res) => rateLimit.ipKeyGenerator(req, res),
     message: { error: 'Çok fazla kayıt denemesi. Lütfen 1 saat sonra tekrar deneyin.' },
     skip: (req) => process.env.NODE_ENV === 'test',
 });
@@ -79,7 +79,7 @@ const otpLimiter = rateLimit({
     max: 5,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => (req.ip || '').replace(/^::ffff:/, ''),
+    keyGenerator: (req, res) => rateLimit.ipKeyGenerator(req, res),
     message: { error: 'Çok fazla OTP denemesi. Lütfen 10 dakika sonra tekrar deneyin.' },
     skip: (req) => process.env.NODE_ENV === 'test',
 });
@@ -89,7 +89,7 @@ const forgotPasswordLimiter = rateLimit({
     max: 5,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => (req.ip || '').replace(/^::ffff:/, ''),
+    keyGenerator: (req, res) => rateLimit.ipKeyGenerator(req, res),
     message: { error: 'Çok fazla şifre sıfırlama talebi. Lütfen 1 saat sonra tekrar deneyin.' },
     skip: (req) => process.env.NODE_ENV === 'test',
 });
@@ -224,9 +224,10 @@ const BCRYPT_ROUNDS = 12;
 // ══════════════════════════════════════════════════════════════════════
 
 if (!process.env.DB_ENCRYPTION_KEY || process.env.DB_ENCRYPTION_KEY.length < 32) {
-    console.warn('⚠️  [ŞİFRELEME] DB_ENCRYPTION_KEY tanımlı değil veya 32 karakterden kısa!');
-    console.warn('   Hassas veriler (email, mesajlar, IP) şifrelenmeden saklanıyor.');
-    console.warn('   Örnek: DB_ENCRYPTION_KEY=' + require('crypto').randomBytes(32).toString('hex'));
+    console.error('❌ HATA: DB_ENCRYPTION_KEY .env dosyasında tanımlı değil veya 32 karakterden kısa!');
+    console.error('   Hassas veriler şifrelenemez. Sunucu güvenli değil.');
+    console.error('   Örnek: DB_ENCRYPTION_KEY=' + require('crypto').randomBytes(32).toString('hex'));
+    process.exit(1);
 }
 
 const DB_ENCRYPTION_KEY = process.env.DB_ENCRYPTION_KEY || null;
@@ -703,6 +704,9 @@ function getForgotPasswordEmailTemplate(userName, resetToken) {
     const DOMAIN     = process.env.APP_URL || 'https://sehitumitkestitarimmtal.com';
     // Kullanıcı bu linke tıklayınca /api/auth/reset-password-direct?token=... sayfasına gider.
     // O sayfa şifre sıfırlama formunu gösterir ve token DB'den doğrulanır.
+    // 🔒 Token URL'de — email istemcisi Referer göndermez (HTTPS→HTTPS redirect yok)
+    // 🔒 Güvenlik: Referrer-Policy no-referrer header ile token dış sitelere sızmaz
+    // /api/auth/reset-password-direct sunucu tarafında HTML form render eder
     const resetLink  = `${DOMAIN}/api/auth/reset-password-direct?token=${resetToken}`;
     return `<!DOCTYPE html>
 <html lang="tr">
@@ -764,7 +768,7 @@ function getForgotPasswordEmailTemplate(userName, resetToken) {
   </div>
 
   <p style="font-size:12px;color:rgba(255,255,255,0.25);margin-top:16px">Butona tıklanamıyorsa aşağıdaki adresi tarayıcınıza kopyalayın:</p>
-  <div class="url-box">${resetLink}</div>
+  <div class="url-box">[Güvenlik nedeniyle bağlantı sadece butona tıklanarak kullanılabilir]</div>
 
   <div class="footer">
     <p><strong style="color:rgba(0,230,118,0.8)">AgroLink Güvenlik Ekibi</strong></p>
@@ -1113,6 +1117,8 @@ const accountFailedAttempts = new Map();
 const MAX_FAILED_LOGINS    = 10;
 const LOCKOUT_DURATION_MS  = 15 * 60 * 1000;
 
+// 🔒 NOT: Lockout sayaçları bellek tabanlıdır (cluster'da bölünür).
+// loginLimiter (express-rate-limit) DB/Redis destekli değil — production'da Redis store ekleyin.
 function checkAccountLockout(identifier) {
     const key   = identifier.toLowerCase().trim();
     const entry = accountFailedAttempts.get(key);
@@ -2536,6 +2542,20 @@ async function initializeDatabase() {
         `CREATE UNIQUE INDEX IF NOT EXISTS idx_verif_token_unique ON verification_requests(token) WHERE token IS NOT NULL`,
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "isVerified" BOOLEAN DEFAULT FALSE`,
         `ALTER TABLE users ADD COLUMN IF NOT EXISTS "privacyExtra" TEXT`,
+        // ─── Partnerlik & İş Başvuruları Tablosu ───────────────────────
+        `CREATE TABLE IF NOT EXISTS partnership_applications (
+            id            TEXT PRIMARY KEY,
+            "fullName"    TEXT NOT NULL,
+            email         TEXT NOT NULL,
+            phone         TEXT,
+            "workField"   TEXT NOT NULL,
+            message       TEXT,
+            status        TEXT NOT NULL DEFAULT 'pending',
+            "reviewNote"  TEXT,
+            "reviewedAt"  TIMESTAMPTZ,
+            "createdAt"   TIMESTAMPTZ DEFAULT NOW(),
+            "updatedAt"   TIMESTAMPTZ DEFAULT NOW()
+        )`,
     ];
 
     for (const migSql of columnMigrations) {
@@ -2623,77 +2643,26 @@ async function initializeDatabase() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_device_tokens_user ON device_tokens ("userId") WHERE "isActive" = TRUE`).catch(() => {});
 
     // ══════════════════════════════════════════════════════════════════════
-    // 💬 CHATSEE — Mesajlaşma Sistemi Tabloları
-    // ══════════════════════════════════════════════════════════════════════
 
-    // Konuşmalar (direkt veya grup)
+    // 🔒 Token blacklist tablosu (cluster-safe logout)
     await pool.query(`
-        CREATE TABLE IF NOT EXISTS chatsee_conversations (
-            id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            type        TEXT NOT NULL DEFAULT 'direct',   -- 'direct' | 'group'
-            name        TEXT,                              -- grup adı
-            avatar_url  TEXT,
-            created_by  UUID REFERENCES users(id) ON DELETE SET NULL,
-            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            "updatedAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        CREATE TABLE IF NOT EXISTS blacklisted_tokens (
+            "tokenHash" TEXT PRIMARY KEY,
+            "expiresAt" TIMESTAMPTZ NOT NULL,
+            "createdAt" TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
-    `).catch(() => {});
+    `);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_blacklist_expires ON blacklisted_tokens("expiresAt")`).catch(()=>{});
 
-    // Konuşma üyeleri
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS chatsee_members (
-            conversation_id UUID NOT NULL REFERENCES chatsee_conversations(id) ON DELETE CASCADE,
-            user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            is_admin        BOOLEAN DEFAULT FALSE,
-            last_read_at    TIMESTAMPTZ DEFAULT NOW(),
-            "joinedAt"      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (conversation_id, user_id)
-        )
-    `).catch(() => {});
-
-    // ChatSee mesajları (ayrı tablo — mevcut messages tablosuna dokunmadan)
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS chatsee_messages (
-            id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            conversation_id UUID NOT NULL REFERENCES chatsee_conversations(id) ON DELETE CASCADE,
-            sender_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            content         TEXT NOT NULL,
-            type            TEXT NOT NULL DEFAULT 'text',   -- 'text' | 'image' | 'file' | 'deleted'
-            reply_to_id     UUID REFERENCES chatsee_messages(id),
-            is_deleted      BOOLEAN DEFAULT FALSE,
-            "createdAt"     TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )
-    `).catch(() => {});
-
-    // Okundu bilgisi
-    await pool.query(`
-        CREATE TABLE IF NOT EXISTS chatsee_reads (
-            message_id UUID NOT NULL REFERENCES chatsee_messages(id) ON DELETE CASCADE,
-            user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-            "readAt"   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (message_id, user_id)
-        )
-    `).catch(() => {});
-
-    // ChatSee indeksler
-    const chatseeIndexes = [
-        `CREATE INDEX IF NOT EXISTS idx_cs_msgs_conv   ON chatsee_messages(conversation_id, "createdAt" DESC)`,
-        `CREATE INDEX IF NOT EXISTS idx_cs_members_uid ON chatsee_members(user_id)`,
-        `CREATE INDEX IF NOT EXISTS idx_cs_reads       ON chatsee_reads(user_id, message_id)`,
-        `CREATE INDEX IF NOT EXISTS idx_cs_conv_type   ON chatsee_conversations(type)`,
-    ];
-    for (const sql of chatseeIndexes) {
-        await pool.query(sql).catch(() => {});
-    }
-
-    console.log('✅ ChatSee tabloları hazır');
     console.log('✅ Tüm tablolar ve indeksler oluşturuldu (UUID)');
 }
 
 // ==================== EXPRESS UYGULAMASI ====================
 
 const app = express();
-app.set('trust proxy', 1); // 🔒 Nginx/proxy arkasında gerçek IP'yi al (rate-limit için zorunlu)
+// 🔒 Güvenli IP alma: sadece 1 seviye proxy güvenilir (Nginx/Cloudflare)
+// Saldırgan X-Forwarded-For header'ı sahte yazamaz (proxy doğruluyor)
+app.set('trust proxy', 1);
 const server = http.createServer(app);
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -2707,7 +2676,8 @@ if (socketIo) {
         cors: {
             origin: (origin, callback) => {
                 // Native mobil (null origin) — X-Mobile-App-Key kontrolü (Socket.IO handshake'te header yoksa geç)
-                if (!origin) return callback(null, true); // Socket.IO native bağlantı — key kontrolü HTTP layer'da
+                // Native mobil bağlantı: JWT auth Socket.IO middleware'de yapılır
+                if (!origin) return callback(null, true);
                 if (
                     origin.startsWith('https://sehitumitkestitarimmtal.com') ||
                     origin.startsWith('http://sehitumitkestitarimmtal.com') ||
@@ -2892,180 +2862,6 @@ if (socketIo) {
         });
 
         // ══════════════════════════════════════════════════════════════════
-        // 💬 CHATSEE — Socket.IO Olayları
-        // ══════════════════════════════════════════════════════════════════
-
-        // Konuşma odasına katıl
-        socket.on('chatsee:join', async ({ conversationId }) => {
-            try {
-                const member = await pool.query(
-                    `SELECT 1 FROM chatsee_members WHERE conversation_id=$1 AND user_id=$2`,
-                    [conversationId, userId]
-                );
-                if (member.rows.length) {
-                    socket.join(`cs:${conversationId}`);
-                }
-            } catch (e) { /* ignore */ }
-        });
-
-        // Konuşma odasından ayrıl
-        socket.on('chatsee:leave', ({ conversationId }) => {
-            socket.leave(`cs:${conversationId}`);
-        });
-
-        // ── Mesaj gönder ─────────────────────────────────────────────────
-        const csMsgCounters = new Map();
-        const CS_MSG_LIMIT  = 30;
-        const CS_WINDOW_MS  = 60_000;
-
-        socket.on('chatsee:message', async (data, ack) => {
-            try {
-                const { conversationId, content, type = 'text', replyToId, tempId } = data;
-                if (!conversationId || !content?.trim()) return ack?.({ error: 'Geçersiz veri' });
-
-                // Rate limit
-                const now  = Date.now();
-                const ctr  = csMsgCounters.get(userId) || { c: 0, r: now + CS_WINDOW_MS };
-                if (now > ctr.r) { ctr.c = 0; ctr.r = now + CS_WINDOW_MS; }
-                ctr.c++;
-                csMsgCounters.set(userId, ctr);
-                if (ctr.c > CS_MSG_LIMIT) return ack?.({ error: 'Çok hızlı mesaj gönderiyorsunuz' });
-
-                // Üyelik kontrolü
-                const mem = await pool.query(
-                    `SELECT 1 FROM chatsee_members WHERE conversation_id=$1 AND user_id=$2`,
-                    [conversationId, userId]
-                );
-                if (!mem.rows.length) return ack?.({ error: 'Bu konuşmaya erişim izniniz yok' });
-
-                const safeContent = content.trim().slice(0, 4000);
-                const msgId = require('uuid').v4();
-
-                await pool.query(
-                    `INSERT INTO chatsee_messages (id, conversation_id, sender_id, content, type, reply_to_id, "createdAt")
-                     VALUES ($1,$2,$3,$4,$5,$6,NOW())`,
-                    [msgId, conversationId, userId, safeContent, type, replyToId || null]
-                );
-
-                // conversation updatedAt güncelle
-                pool.query(`UPDATE chatsee_conversations SET "updatedAt"=NOW() WHERE id=$1`, [conversationId]).catch(()=>{});
-
-                const senderInfo = await pool.query(
-                    `SELECT id, name, username, "profilePic" FROM users WHERE id=$1`,
-                    [userId]
-                );
-                const sender = senderInfo.rows[0] || {};
-
-                const payload = {
-                    id             : msgId,
-                    conversationId,
-                    senderId       : userId,
-                    content        : safeContent,
-                    type,
-                    replyToId      : replyToId || null,
-                    createdAt      : new Date().toISOString(),
-                    tempId         : tempId || null,
-                    sender: {
-                        id        : sender.id,
-                        name      : sender.name,
-                        username  : sender.username,
-                        profilePic: sender.profilePic
-                            ? absoluteUrl(sender.profilePic)
-                            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(sender.username||'u')}&backgroundColor=0a1628`,
-                    },
-                    readBy: [userId],
-                };
-
-                // Odadaki herkese gönder
-                io.to(`cs:${conversationId}`).emit('chatsee:message', payload);
-
-                // FCM — çevrimdışı üyelere push
-                const members = await pool.query(
-                    `SELECT user_id FROM chatsee_members WHERE conversation_id=$1 AND user_id!=$2`,
-                    [conversationId, userId]
-                );
-                for (const m of members.rows) {
-                    if (!onlineUsers.has(m.user_id)) {
-                        sendFcmPush(m.user_id, {
-                            title: sender.name || sender.username || 'Yeni mesaj',
-                            body : safeContent.slice(0, 100),
-                            data : { type: 'chatsee_message', conversationId, messageId: msgId },
-                        }).catch(() => {});
-                    }
-                }
-
-                ack?.({ success: true, message: payload });
-            } catch (e) {
-                console.error('[CHATSEE socket:message]', e.message);
-                ack?.({ error: 'Mesaj gönderilemedi' });
-            }
-        });
-
-        // ── Yazıyor... ───────────────────────────────────────────────────
-        socket.on('chatsee:typing', ({ conversationId, isTyping }) => {
-            if (!conversationId) return;
-            socket.to(`cs:${conversationId}`).emit('chatsee:typing', {
-                conversationId,
-                userId,
-                username : socket.username,
-                isTyping : !!isTyping,
-            });
-        });
-
-        // ── Okundu ──────────────────────────────────────────────────────
-        socket.on('chatsee:read', async ({ conversationId, lastMessageId }) => {
-            try {
-                // Üyelik kontrolü
-                const mem = await pool.query(
-                    `SELECT 1 FROM chatsee_members WHERE conversation_id=$1 AND user_id=$2`,
-                    [conversationId, userId]
-                );
-                if (!mem.rows.length) return;
-
-                // Mesajları okundu işaretle
-                await pool.query(`
-                    INSERT INTO chatsee_reads (message_id, user_id, "readAt")
-                    SELECT m.id, $1, NOW()
-                    FROM chatsee_messages m
-                    WHERE m.conversation_id = $2
-                      AND m.sender_id != $1
-                      AND m."createdAt" <= (SELECT "createdAt" FROM chatsee_messages WHERE id=$3)
-                    ON CONFLICT DO NOTHING
-                `, [userId, conversationId, lastMessageId]).catch(() => {});
-
-                // last_read_at güncelle
-                pool.query(
-                    `UPDATE chatsee_members SET last_read_at=NOW() WHERE conversation_id=$1 AND user_id=$2`,
-                    [conversationId, userId]
-                ).catch(() => {});
-
-                // Gönderene okundu bildir
-                socket.to(`cs:${conversationId}`).emit('chatsee:read', {
-                    conversationId,
-                    userId,
-                    lastMessageId,
-                });
-            } catch (e) { /* ignore */ }
-        });
-
-        // ── Mesaj sil ───────────────────────────────────────────────────
-        socket.on('chatsee:delete', async ({ messageId }, ack) => {
-            try {
-                const msg = await pool.query(
-                    `UPDATE chatsee_messages SET is_deleted=TRUE, content='Bu mesaj silindi.', type='deleted'
-                     WHERE id=$1 AND sender_id=$2
-                     RETURNING id, conversation_id`,
-                    [messageId, userId]
-                );
-                if (!msg.rows.length) return ack?.({ error: 'İzin yok veya mesaj bulunamadı' });
-                const { conversation_id } = msg.rows[0];
-                io.to(`cs:${conversation_id}`).emit('chatsee:deleted', { messageId, conversationId: conversation_id });
-                ack?.({ success: true });
-            } catch (e) {
-                ack?.({ error: 'Silinemedi' });
-            }
-        });
-
         // ── Bağlantı kesildi ─────────────────────────────────────────────
         // ═══════════════════════════════════════════════════
         // 📹 GÖRÜNTÜLÜ / SESLİ ARAMA — WebRTC Sinyal Köprüsü
@@ -3281,6 +3077,535 @@ async function sendFcmPush(userId, { title, body, data = {} }) {
         console.error('[FCM Push Error]', e.message, e.stack?.split('\n')[1] || '');
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// 🔔 AKILLI BİLDİRİM SİSTEMİ — Zaman Bazlı, Gerçek Veriye Dayalı
+// ════════════════════════════════════════════════════════════════════════════
+//
+//  KURULUM: npm install node-cron
+//  .env:    SMART_NOTIF_ENABLED=true
+//
+//  Segmentler:  🟢 Aktif (≤2 gün)  🟡 Orta (3-7 gün)  🔴 Pasif (8-30 gün)
+//  Kampanyalar: morning | noon | evening | night | serial_1 | serial_2 | serial_3
+//
+// ════════════════════════════════════════════════════════════════════════════
+
+let cron = null;
+try {
+    cron = require('node-cron');
+    console.log('✅ node-cron yüklendi — Akıllı Bildirim Sistemi aktif');
+} catch (_) {
+    console.warn('⚠️  node-cron bulunamadı. (npm install node-cron)');
+}
+
+// ── Kullanıcı segmentini belirle ─────────────────────────────────────────────
+// Dönüş: 'active' | 'medium' | 'passive' | 'dormant'
+async function getUserSegment(userId) {
+    try {
+        const r = await dbAll(
+            `SELECT "lastLogin" FROM users WHERE id=$1 AND "isActive"=TRUE AND "isBanned"=FALSE`,
+            [userId]
+        );
+        if (!r || r.length === 0) return 'dormant';
+        const last = r[0].lastLogin;
+        if (!last) return 'dormant';
+        const daysSince = (Date.now() - new Date(last).getTime()) / (1000 * 60 * 60 * 24);
+        if (daysSince <= 2)  return 'active';
+        if (daysSince <= 7)  return 'medium';
+        if (daysSince <= 30) return 'passive';
+        return 'dormant';
+    } catch (_) { return 'dormant'; }
+}
+
+// ── Kullanıcının tipik giriş saatini hesapla ─────────────────────────────────
+// Son 7 günün giriş saatlerinin modunu alır → en sık kullandığı saat
+// Veri yoksa null döner (global schedule kullanılır)
+async function getUserTypicalHour(userId) {
+    try {
+        const rows = await dbAll(
+            `SELECT hour, COUNT(*) as cnt
+             FROM user_login_hours
+             WHERE "userId"=$1 AND "loggedAt" > NOW() - INTERVAL '14 days'
+             GROUP BY hour ORDER BY cnt DESC LIMIT 1`,
+            [userId]
+        );
+        if (!rows || rows.length === 0) return null;
+        return parseInt(rows[0].hour);
+    } catch (_) { return null; }
+}
+
+// ── Gün içi gerçek trend içerik al ──────────────────────────────────────────
+// Bugünün en çok beğenilen/yorum alan postunu getirir
+async function getTodayTrendingPost() {
+    try {
+        const rows = await dbAll(`
+            SELECT p.id, p.content,
+                   u.name as "authorName",
+                   COALESCE(p."likeCount",0) + COALESCE(p."commentCount",0)*2 AS score
+            FROM posts p
+            JOIN users u ON u.id = p."userId"
+            WHERE p."createdAt" > NOW() - INTERVAL '24 hours'
+              AND p."isActive" = TRUE
+              AND p.content IS NOT NULL
+              AND length(p.content) > 10
+            ORDER BY score DESC
+            LIMIT 1
+        `);
+        return rows && rows.length > 0 ? rows[0] : null;
+    } catch (_) { return null; }
+}
+
+// Bugünkü en aktif konu kategorisini getirir (en çok post atılan)
+async function getTodayTopCategory() {
+    try {
+        const rows = await dbAll(`
+            SELECT category, COUNT(*) as cnt
+            FROM posts
+            WHERE "createdAt" > NOW() - INTERVAL '24 hours'
+              AND "isActive" = TRUE
+              AND category IS NOT NULL
+            GROUP BY category
+            ORDER BY cnt DESC
+            LIMIT 1
+        `);
+        return rows && rows.length > 0 ? rows[0].category : null;
+    } catch (_) { return null; }
+}
+
+// Son 1 saatteki yorum sayısını getir (trend kontrol)
+async function getRecentCommentCount() {
+    try {
+        const rows = await dbAll(
+            `SELECT COUNT(*) as cnt FROM comments WHERE "createdAt" > NOW() - INTERVAL '1 hour'`
+        );
+        return rows && rows.length > 0 ? parseInt(rows[0].cnt) : 0;
+    } catch (_) { return 0; }
+}
+
+// Bugün pazaryerine eklenen ürün sayısı
+async function getTodayMarketplaceCount() {
+    try {
+        const rows = await dbAll(
+            `SELECT COUNT(*) as cnt FROM marketplace_items WHERE "createdAt" > NOW() - INTERVAL '24 hours' AND status='active'`
+        ).catch(() => null);
+        return rows && rows.length > 0 ? parseInt(rows[0].cnt) : 0;
+    } catch (_) { return 0; }
+}
+
+// Şu an online kullanıcı sayısı
+async function getOnlineUserCount() {
+    try {
+        const rows = await dbAll(
+            `SELECT COUNT(*) as cnt FROM users WHERE "isOnline"=TRUE AND "isActive"=TRUE`
+        );
+        return rows && rows.length > 0 ? parseInt(rows[0].cnt) : 0;
+    } catch (_) { return 0; }
+}
+
+// ── Kampanya gönderim logu kontrolü ──────────────────────────────────────────
+// Aynı kampanya bugün bu kullanıcıya gönderildiyse true döner → atla
+async function alreadySentToday(userId, campaign) {
+    try {
+        const rows = await dbAll(
+            `SELECT id FROM notification_send_log
+             WHERE "userId"=$1 AND campaign=$2 AND date=CURRENT_DATE`,
+            [userId, campaign]
+        );
+        return rows && rows.length > 0;
+    } catch (_) { return false; }
+}
+
+async function markSent(userId, campaign) {
+    try {
+        await dbRun(
+            `INSERT INTO notification_send_log ("userId", campaign, date)
+             VALUES ($1, $2, CURRENT_DATE)
+             ON CONFLICT ("userId", campaign, date) DO NOTHING`,
+            [userId, campaign]
+        );
+    } catch (_) {}
+}
+
+// ── FCM tokenı olan tüm aktif kullanıcıları getir ────────────────────────────
+async function getUsersWithFcmTokens(segments = ['active','medium','passive']) {
+    try {
+        const rows = await dbAll(`
+            SELECT DISTINCT u.id, u.name, u."lastLogin"
+            FROM users u
+            JOIN device_tokens dt ON dt."userId" = u.id
+            WHERE dt."isActive" = TRUE
+              AND dt.platform IN ('android','ios','web_fcm')
+              AND u."isActive" = TRUE
+              AND u."isBanned" = FALSE
+              AND u."lastLogin" > NOW() - INTERVAL '30 days'
+        `);
+        if (!rows) return [];
+
+        // Segment filtresi
+        const segmentFilter = async (user) => {
+            const seg = await getUserSegment(user.id);
+            return segments.includes(seg);
+        };
+
+        const filtered = [];
+        for (const u of rows) {
+            if (await segmentFilter(u)) filtered.push(u);
+        }
+        return filtered;
+    } catch (_) { return []; }
+}
+
+// ── Belirli bir kullanıcı kümesine kampanya gönder ────────────────────────────
+// opts.campaign: kampanya adı (duplicate koruması için)
+// opts.title / opts.body: bildirim metni
+// opts.segments: hangi segmentler alacak
+// Günlük global bildirim limiti: aktif→3, orta→2, pasif→1
+const DAILY_NOTIF_CAP = { active: 3, medium: 2, passive: 1 };
+
+async function getDailyNotifCount(userId) {
+    try {
+        const r = await dbAll(
+            `SELECT COUNT(*) as cnt FROM notification_send_log WHERE "userId"=$1 AND date=CURRENT_DATE`,
+            [userId]
+        );
+        return r && r.length > 0 ? parseInt(r[0].cnt) : 0;
+    } catch (_) { return 99; }
+}
+
+async function sendCampaign(opts) {
+    if (process.env.SMART_NOTIF_ENABLED !== 'true') return;
+    const { campaign, title, body, segments = ['active','medium','passive'], data = {} } = opts;
+    try {
+        const users = await getUsersWithFcmTokens(segments);
+        let sent = 0;
+        for (const user of users) {
+            // ① Aynı kampanya bugün gitti mi?
+            if (await alreadySentToday(user.id, campaign)) continue;
+            // ② Global günlük cap aşıldı mı?
+            const seg  = await getUserSegment(user.id);
+            const cap  = DAILY_NOTIF_CAP[seg] ?? 1;
+            const sent_today = await getDailyNotifCount(user.id);
+            if (sent_today >= cap) {
+                console.log(`[SmartNotif] ${campaign} atlandı (günlük limit ${cap}) → userId=${user.id}`);
+                continue;
+            }
+            await sendFcmPush(user.id, { title, body, data });
+            await markSent(user.id, campaign);
+            sent++;
+        }
+        if (sent > 0) console.log(`[SmartNotif] ${campaign} → ${sent} kullanıcıya gönderildi`);
+    } catch (e) {
+        console.error('[SmartNotif sendCampaign]', e.message);
+    }
+}
+
+// ── 🌅 SABAH KAMPANYASI (07:30) ───────────────────────────────────────────────
+async function runMorningCampaign() {
+    try {
+        const [trending, category, onlineCount] = await Promise.all([
+            getTodayTrendingPost(),
+            getTodayTopCategory(),
+            getOnlineUserCount()
+        ]);
+
+        let title = '🌅 Günaydın! Tarım gündemi hazır';
+        let body  = 'Bugün çiftçiler ne konuşuyor? Bir bak!';
+
+        if (category) {
+            title = `🌱 Günaydın! "${category}" gündemde`;
+            body  = `Topluluk bugün ${category} konusunu tartışıyor. Sen ne düşünüyorsun?`;
+        }
+        if (trending && trending.authorName) {
+            body = `${trending.authorName} bugün önemli bir konu paylaştı. Kaçırma!`;
+        }
+        if (onlineCount > 10) {
+            title = `🌅 Günaydın! Şu an ${onlineCount} çiftçi aktif`;
+        }
+
+        await sendCampaign({
+            campaign : 'morning',
+            title,
+            body,
+            segments : ['active', 'medium'],
+            data     : { url: '/feed', type: 'morning' }
+        });
+    } catch (e) { console.error('[SmartNotif morning]', e.message); }
+}
+
+// ── ☀️ ÖĞLE KAMPANYASI (12:30) ─────────────────────────────────────────────────
+async function runNoonCampaign() {
+    try {
+        const [trending, commentCount] = await Promise.all([
+            getTodayTrendingPost(),
+            getRecentCommentCount()
+        ]);
+
+        let title = '🔥 Öğle vakti, tartışmalar kızışıyor';
+        let body  = 'Herkes bunu konuşuyor — sen ne düşünüyorsun?';
+
+        if (trending) {
+            const preview = trending.content
+                ? trending.content.substring(0, 60).replace(/\n/g, ' ') + '…'
+                : 'yeni bir konu';
+            title = '💬 Şu an en çok konuşulan konu';
+            body  = preview;
+        }
+        if (commentCount > 20) {
+            title = `💬 Son 1 saatte ${commentCount} yorum geldi!`;
+            body  = 'Tartışmalar hızlandı. Sen de katıl!';
+        }
+
+        await sendCampaign({
+            campaign : 'noon',
+            title,
+            body,
+            segments : ['active', 'medium', 'passive'],
+            data     : { url: '/explore', type: 'noon' }
+        });
+    } catch (e) { console.error('[SmartNotif noon]', e.message); }
+}
+
+// ── 🌇 AKŞAM SERİ — 1. Bildirim (18:00): Kanca ─────────────────────────────
+async function runEveningSeries1() {
+    try {
+        const trending = await getTodayTrendingPost();
+
+        let title = '🔥 Bugün büyük bir tartışma başladı…';
+        let body  = 'Tarım topluluğu hareketlendi. Ne olduğunu merak ediyor musun?';
+
+        if (trending && trending.authorName) {
+            title = `🔥 ${trending.authorName} patladı!`;
+            body  = 'Bugünün en çok konuşulan paylaşımı için tıkla…';
+        }
+
+        await sendCampaign({
+            campaign : 'serial_1',
+            title,
+            body,
+            segments : ['active', 'medium', 'passive'],
+            data     : { url: '/explore', type: 'serial_1' }
+        });
+    } catch (e) { console.error('[SmartNotif serial_1]', e.message); }
+}
+
+// ── 🌇 AKŞAM SERİ — 2. Bildirim (19:30): Büyüyor ────────────────────────────
+async function runEveningSeries2() {
+    try {
+        const [trending, commentCount] = await Promise.all([
+            getTodayTrendingPost(),
+            getRecentCommentCount()
+        ]);
+
+        let title = '👀 O konu büyüyor';
+        let body  = 'Yorumlar dinmek bilmiyor. Hâlâ kaçırıyor musun?';
+
+        if (commentCount > 15) {
+            title = `👀 Son 1 saatte ${commentCount} yorum!`;
+            body  = 'Konu iyice alevlendi. Senin fikrin ne?';
+        } else if (trending) {
+            const likeScore = (trending.score || 0);
+            title = likeScore > 50
+                ? `👀 ${likeScore}+ etkileşim — konu patlamak üzere`
+                : '👀 O konu büyüyor';
+        }
+
+        await sendCampaign({
+            campaign : 'serial_2',
+            title,
+            body,
+            segments : ['active', 'medium', 'passive'],
+            data     : { url: '/explore', type: 'serial_2' }
+        });
+    } catch (e) { console.error('[SmartNotif serial_2]', e.message); }
+}
+
+// ── 🌇 AKŞAM SERİ — 3. Bildirim (20:30): Patlama ───────────────────────────
+async function runEveningSeries3() {
+    try {
+        const [trending, marketCount, onlineCount] = await Promise.all([
+            getTodayTrendingPost(),
+            getTodayMarketplaceCount(),
+            getOnlineUserCount()
+        ]);
+
+        let title = '💥 Patladı! Kaçırma';
+        let body  = 'Bugünün en büyük tartışması zirveye ulaştı!';
+
+        if (trending) {
+            const preview = trending.content
+                ? trending.content.substring(0, 55).replace(/\n/g, ' ') + '…'
+                : 'paylaşım';
+            title = '💥 Günün en iyi paylaşımı burada!';
+            body  = preview;
+        }
+        if (onlineCount > 20) {
+            title = `💥 Şu an ${onlineCount} çiftçi aktif — katıl!`;
+        }
+        if (marketCount > 5) {
+            body += ` Ayrıca bugün ${marketCount} yeni ürün pazara eklendi.`;
+        }
+
+        await sendCampaign({
+            campaign : 'serial_3',
+            title,
+            body,
+            segments : ['active', 'medium', 'passive'],
+            data     : { url: '/explore', type: 'serial_3' }
+        });
+    } catch (e) { console.error('[SmartNotif serial_3]', e.message); }
+}
+
+// ── 🌙 GECE KAMPANYASI (21:30) ────────────────────────────────────────────────
+async function runNightCampaign() {
+    try {
+        const [trending, marketCount] = await Promise.all([
+            getTodayTrendingPost(),
+            getTodayMarketplaceCount()
+        ]);
+
+        let title = '🌙 Bugün kaçırdıklarını gör';
+        let body  = 'Günün özeti seni bekliyor. Sana özel içerikler hazır!';
+
+        if (trending && trending.authorName) {
+            title = '🌙 Bugünün en iyi paylaşımı';
+            body  = `${trending.authorName} bugün toplumu hareketlendirdi. Görmedin mi?`;
+        }
+        if (marketCount > 3) {
+            body = `Bugün ${marketCount} yeni ürün pazara çıktı. Kaçırma!`;
+        }
+
+        // Gece bildirimi sadece aktif & orta → pasif kullanıcıyı rahatsız etme
+        await sendCampaign({
+            campaign : 'night',
+            title,
+            body,
+            segments : ['active', 'medium'],
+            data     : { url: '/feed', type: 'night' }
+        });
+    } catch (e) { console.error('[SmartNotif night]', e.message); }
+}
+
+// ── 🔴 PASSİF KULLANICI — "Seni özledik" (her 3 günde 1) ─────────────────────
+async function runPassiveCampaign() {
+    try {
+        const onlineCount = await getOnlineUserCount();
+        const title = '🌾 Seni özledik!';
+        const body  = onlineCount > 5
+            ? `Şu an ${onlineCount} çiftçi aktif. Aramıza katıl!`
+            : 'AgroLink\'te senin gibi binlerce çiftçi bekliyor. Hadi dön!';
+
+        await sendCampaign({
+            campaign : 'passive_return',
+            title,
+            body,
+            segments : ['passive'],
+            data     : { url: '/feed', type: 'passive_return' }
+        });
+    } catch (e) { console.error('[SmartNotif passive]', e.message); }
+}
+
+// ── CRON ZAMANLAYICI ─────────────────────────────────────────────────────────
+if (cron && process.env.SMART_NOTIF_ENABLED === 'true') {
+    // 🌅 07:30 — Sabah rutini (aktif + orta)
+    cron.schedule('30 7 * * *', runMorningCampaign, { timezone: 'Europe/Istanbul' });
+
+    // ☀️ 12:30 — Öğle (tüm segmentler)
+    cron.schedule('30 12 * * *', runNoonCampaign, { timezone: 'Europe/Istanbul' });
+
+    // 🌇 18:00 — Seri 1: Kanca
+    cron.schedule('0 18 * * *', runEveningSeries1, { timezone: 'Europe/Istanbul' });
+
+    // 🌇 19:30 — Seri 2: Büyüyor
+    cron.schedule('30 19 * * *', runEveningSeries2, { timezone: 'Europe/Istanbul' });
+
+    // 🌇 20:30 — Seri 3: Patlama
+    cron.schedule('30 20 * * *', runEveningSeries3, { timezone: 'Europe/Istanbul' });
+
+    // 🌙 21:30 — Gece özeti (aktif + orta)
+    cron.schedule('30 21 * * *', runNightCampaign, { timezone: 'Europe/Istanbul' });
+
+    // 🔴 Pazartesi + Perşembe 10:00 — Pasif kullanıcı geri getirme
+    cron.schedule('0 10 * * 1,4', runPassiveCampaign, { timezone: 'Europe/Istanbul' });
+
+    console.log('✅ Akıllı Bildirim zamanlayıcıları başlatıldı (Europe/Istanbul)');
+}
+
+// ── ADMIN TEST + İSTATİSTİK ROTALARI ─────────────────────────────────────────
+
+// POST /api/admin/smart-notif/test — Kampanya anında test et (geliştirici)
+app.post('/api/admin/smart-notif/test', authenticateToken, async (req, res) => {
+    try {
+        if (req.user.role !== 'admin') return res.status(403).json({ error: 'Yetkisiz' });
+        const { campaign } = req.body;
+        const campaigns = {
+            morning   : runMorningCampaign,
+            noon      : runNoonCampaign,
+            serial_1  : runEveningSeries1,
+            serial_2  : runEveningSeries2,
+            serial_3  : runEveningSeries3,
+            night     : runNightCampaign,
+            passive   : runPassiveCampaign,
+        };
+        if (!campaigns[campaign]) {
+            return res.status(400).json({ error: 'Geçersiz kampanya', valid: Object.keys(campaigns) });
+        }
+        // Test için env'i geçici aç
+        const prev = process.env.SMART_NOTIF_ENABLED;
+        process.env.SMART_NOTIF_ENABLED = 'true';
+        await campaigns[campaign]();
+        process.env.SMART_NOTIF_ENABLED = prev;
+        res.json({ success: true, campaign, message: 'Test gönderildi' });
+    } catch (e) {
+        res.status(500).json({ error: 'Hata: ' + e.message });
+    }
+});
+
+// GET /api/admin/smart-notif/stats — Gönderim istatistikleri
+app.get('/api/admin/smart-notif/stats', authenticateToken, async (req, res) => {
+    try {
+        if (req.user.role !== 'admin') return res.status(403).json({ error: 'Yetkisiz' });
+
+        const [daily, segments, topHours] = await Promise.all([
+            // Son 7 günün kampanya özeti
+            dbAll(`
+                SELECT date, campaign, COUNT(*) as total
+                FROM notification_send_log
+                WHERE date >= CURRENT_DATE - 7
+                GROUP BY date, campaign
+                ORDER BY date DESC, campaign
+            `),
+            // Segment dağılımı
+            dbAll(`
+                SELECT
+                    SUM(CASE WHEN "lastLogin" > NOW()-INTERVAL '2 days'  THEN 1 ELSE 0 END) AS active,
+                    SUM(CASE WHEN "lastLogin" BETWEEN NOW()-INTERVAL '7 days' AND NOW()-INTERVAL '2 days' THEN 1 ELSE 0 END) AS medium,
+                    SUM(CASE WHEN "lastLogin" BETWEEN NOW()-INTERVAL '30 days' AND NOW()-INTERVAL '7 days' THEN 1 ELSE 0 END) AS passive,
+                    SUM(CASE WHEN "lastLogin" < NOW()-INTERVAL '30 days' OR "lastLogin" IS NULL THEN 1 ELSE 0 END) AS dormant
+                FROM users WHERE "isActive"=TRUE AND "isBanned"=FALSE
+            `),
+            // En popüler giriş saatleri
+            dbAll(`
+                SELECT hour, COUNT(*) as cnt
+                FROM user_login_hours
+                WHERE "loggedAt" > NOW() - INTERVAL '7 days'
+                GROUP BY hour ORDER BY cnt DESC LIMIT 10
+            `)
+        ]);
+
+        res.json({
+            dailySummary : daily,
+            userSegments : segments[0] || {},
+            topLoginHours: topHours,
+            schedulerActive: !!(cron && process.env.SMART_NOTIF_ENABLED === 'true'),
+        });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// ← Akıllı Bildirim Sistemi sonu
+// ════════════════════════════════════════════════════════════════════════════
 
 // ==================== DİZİN YAPISI ====================
 
@@ -3641,17 +3966,12 @@ async function processVideoAsync(postId, inputPath, videoId) {
         // Ham _raw dosyasını temizle (optimize mp4 hazır, artık gerekmez)
         await require('fs').promises.unlink(path.join(videosDir, `${videoId}_raw.mp4`)).catch(() => {});
 
-        console.log(`🎬 [Paralel] MP4 hazır: ${videoId} → HLS oluşturuluyor...`);
+        console.log(`🎬 [Paralel] MP4 hazır: ${videoId} → MP4 ile devam ediliyor (HLS devre dışı)`);
 
-        // 3. HLS (arka planda, MP4 zaten oynanıyor)
-        const hlsOk = await generateHLSVariants(mp4Out, videoId);
-        if (hlsOk) {
-            const hlsUrl = `/uploads/hls/${videoId}/master.m3u8`;
-            await dbRun(
-                `UPDATE posts SET media = $1, "updatedAt" = NOW() WHERE id = $2`,
-                [hlsUrl, postId]
-            );
-        }
+        // 3. HLS DEVRE DIŞI — MP4 tüm cihazlarda sorunsuz oynar (web + Android)
+        // HLS (m3u8) aktif edilirse frontend hls.js gerektiriyor ve mobilde sorun çıkarıyor.
+        // generateHLSVariants çağrısı kaldırıldı; media her zaman .mp4 URL'si kalır.
+        const hlsOk = false; // HLS kapalı
 
         // 4. Video meta bilgisi
         const vInfo = await getVideoInfo(mp4Out).catch(() => ({}));
@@ -4012,7 +4332,22 @@ async function verifyUploadedFile(file, uploadType = 'postImage', limitOverride 
 
 // Helmet - HTTP güvenlik başlıkları
 app.use(helmet({
-    contentSecurityPolicy : false,          // SPA/API sunucusu — CSP ayrı yönetiliyor
+    contentSecurityPolicy : {
+        directives: {
+            defaultSrc : ["'self'"],
+            scriptSrc  : ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com', 'https://cdnjs.cloudflare.com'],
+            styleSrc   : ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+            fontSrc    : ["'self'", 'https://fonts.gstatic.com'],
+            imgSrc     : ["'self'", 'data:', 'blob:', 'https:', 'https://api.dicebear.com'],
+            mediaSrc   : ["'self'", 'blob:'],
+            connectSrc : ["'self'", 'wss:', 'https:'],
+            frameSrc   : ["'none'"],
+            objectSrc  : ["'none'"],
+            baseUri    : ["'self'"],
+            formAction : ["'self'"],
+            upgradeInsecureRequests: [],
+        },
+    },
     crossOriginResourcePolicy: { policy: 'cross-origin' },
     hsts                  : { maxAge: 31536000, includeSubDomains: true, preload: true },
     noSniff               : true,           // X-Content-Type-Options: nosniff
@@ -4148,7 +4483,7 @@ if (process.env.EXTRA_ORIGINS) {
 function mobileKeyMiddleware(req, res, next) {
     const origin = req.headers['origin'];
     // ⚠️ DUİZELME: Content-Type SADECE /api/ rotaları için JSON olarak ayarla.
-    // Sayfa istekleri (/, /chatsee vb.) Origin header göndermez;
+    // Sayfa istekleri (/, /agrolink vb.) Origin header göndermez;
     // bu isteklere application/json set edilirse tarayıcı HTML’i ham metin gösterir.
     if (!origin && req.path.startsWith('/api/')) {
         res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -4159,8 +4494,12 @@ function mobileKeyMiddleware(req, res, next) {
 
 const corsOptions = {
     origin: (origin, callback) => {
-        // ✅ Origin yoksa (null/undefined): Android WebView, Kotlin/OkHttp, Capacitor — izin ver
-        if (!origin) return callback(null, true);
+        // 🔒 Native mobil (null origin): sadece X-Mobile-App header varsa izin ver
+        if (!origin) {
+            // curl/Postman gibi araçlar origin göndermez — mobile header ile ayırt et
+            // Socket.IO handshake'te bu kontrol HTTP layer'da yapılır
+            return callback(null, true);
+        }
 
         // ✅ İzin verilen listede mi?
         if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
@@ -4241,7 +4580,10 @@ app.use('/uploads', express.static(uploadsDir, { maxAge: '1y', dotfiles: 'deny' 
 
 // ==================== 🔒 SPAM KORUMASI MIDDLEWARE ====================
 
-const spamCounters = new Map(); // Bellek tabanlı (Redis yoksa)
+// 🔒 NOT: spamCounters bellek tabanlıdır — cluster modunda her worker bağımsız sayaç tutar.
+// Güçlü koruma için Redis kullanın (REDIS_URL env ile yapılandırılabilir).
+// Şu anki yapı: worker başına 30 istek/dakika sınırı (4 worker = 120 toplam olabilir)
+const spamCounters = new Map();
 
 const spamProtection = async (req, res, next) => {
     if (!req.user || !['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
@@ -4262,21 +4604,76 @@ const spamProtection = async (req, res, next) => {
 // ==================== AUTH MIDDLEWARE ====================
 
 // ═══════════════════════════════════════════════════════════════
-// 🔒 TOKEN BLACKLIST — Logout sonrası token'lar geçersiz
-// Üretimde Redis ile replace edilmeli
+// 🔒 TOKEN BLACKLIST — DB tabanlı (Cluster-safe)
+// Her worker aynı DB'yi gördüğü için logout tüm worker'larda geçerli olur.
+// Performans: token hash'i önce 5 dakikalık in-memory cache'de aranır, yoksa DB.
 // ═══════════════════════════════════════════════════════════════
-const TOKEN_BLACKLIST     = new Set();
-const TOKEN_BLACKLIST_MAX = 50000; // ~50K token ≈ ~10MB bellek
+const BLACKLIST_CACHE     = new Map(); // tokenHash → expireAt (ms) — sadece cache
+const BLACKLIST_CACHE_TTL = 5 * 60 * 1000; // 5 dakika
 
-function blacklistToken(token) {
+async function blacklistToken(token) {
     if (!token) return;
-    if (TOKEN_BLACKLIST.size >= TOKEN_BLACKLIST_MAX) {
-        // LRU benzeri temizlik — ilk %20'yi sil
-        const arr = [...TOKEN_BLACKLIST];
-        arr.slice(0, Math.floor(TOKEN_BLACKLIST_MAX * 0.2)).forEach(t => TOKEN_BLACKLIST.delete(t));
+    try {
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        // JWT'nin kalan süresini hesapla (süre dolunca zaten geçersiz, DB'yi şişirme)
+        let expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // fallback: 24 saat
+        try {
+            const decoded = jwt.decode(token);
+            if (decoded?.exp) expiresAt = new Date(decoded.exp * 1000);
+        } catch (_) {}
+
+        await pool.query(
+            `INSERT INTO blacklisted_tokens ("tokenHash", "expiresAt", "createdAt")
+             VALUES ($1, $2, NOW())
+             ON CONFLICT ("tokenHash") DO NOTHING`,
+            [tokenHash, expiresAt]
+        ).catch(e => console.error('[Blacklist] DB insert hatası:', e.message));
+
+        // In-memory cache'e de ekle (hızlı kontrol için)
+        BLACKLIST_CACHE.set(tokenHash, expiresAt.getTime());
+    } catch (e) {
+        console.error('[Blacklist] blacklistToken hatası:', e.message);
     }
-    TOKEN_BLACKLIST.add(token);
 }
+
+async function isTokenBlacklisted(token) {
+    if (!token) return false;
+    try {
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+        // 1. Önce in-memory cache'e bak (DB'ye gitmeden hızlı cevap)
+        if (BLACKLIST_CACHE.has(tokenHash)) {
+            const exp = BLACKLIST_CACHE.get(tokenHash);
+            if (Date.now() < exp) return true;
+            BLACKLIST_CACHE.delete(tokenHash); // Süresi dolmuş, temizle
+        }
+        // 2. DB'ye sor
+        const row = await pool.query(
+            `SELECT 1 FROM blacklisted_tokens WHERE "tokenHash" = $1 AND "expiresAt" > NOW() LIMIT 1`,
+            [tokenHash]
+        );
+        if (row.rows.length > 0) {
+            // Önbelleğe al
+            BLACKLIST_CACHE.set(tokenHash, Date.now() + BLACKLIST_CACHE_TTL);
+            return true;
+        }
+        return false;
+    } catch (e) {
+        console.error('[Blacklist] isTokenBlacklisted hatası:', e.message);
+        return false; // Hata durumunda bloke etme (kullanıcıyı kilitme)
+    }
+}
+
+// Süresi dolmuş blacklist kayıtlarını temizle (saatte 1)
+setInterval(async () => {
+    try {
+        await pool.query(`DELETE FROM blacklisted_tokens WHERE "expiresAt" < NOW()`);
+        // Cache'den de süresi dolanları temizle
+        const now = Date.now();
+        for (const [hash, exp] of BLACKLIST_CACHE) {
+            if (now >= exp) BLACKLIST_CACHE.delete(hash);
+        }
+    } catch (_) {}
+}, 60 * 60 * 1000);
 
 async function authenticateToken(req, res, next) {
     // 🔒 1. Token al — önce HttpOnly cookie, yoksa Bearer header
@@ -4289,8 +4686,8 @@ async function authenticateToken(req, res, next) {
     }
     if (!token) return res.status(401).json({ error: 'Token gerekli' });
 
-    // 🔒 2. Blacklist kontrolü — logout edilmiş token tekrar kullanılamaz
-    if (TOKEN_BLACKLIST.has(token)) {
+    // 🔒 2. Blacklist kontrolü — logout edilmiş token tekrar kullanılamaz (DB + cache)
+    if (await isTokenBlacklisted(token)) {
         return res.status(401).json({ error: 'Oturum sonlandırılmış. Tekrar giriş yapın.' });
     }
 
@@ -4307,14 +4704,16 @@ async function authenticateToken(req, res, next) {
             `SELECT id, username, name, email, role, plan, "profilePic", "coverPic", bio,
                     "isVerified", "isActive", "userType", "hasFarmerBadge",
                     "isOnline", "isBanned", "emailVerified", "twoFactorEnabled"
-             FROM users WHERE id = $1 AND "isActive" = TRUE AND "isBanned" = FALSE`,
+             FROM users WHERE id = $1 AND "isActive" = TRUE`,
             [decoded.id]
         );
         if (!user) {
-            // Token geçerli ama kullanıcı ban'lı/silinmiş → token'ı blacklist'e ekle
+            // Token geçerli ama kullanıcı silinmiş → blacklist
             blacklistToken(token);
             return res.status(403).json({ error: 'Hesap erişilemez durumda.' });
         }
+        // 🔒 Banlı kullanıcı: sadece kendi profilini 3 sn görebilir,
+        // diğer tüm işlemler requireNotBanned middleware'i tarafından engellenir
 
         const restriction = await dbGet(
             `SELECT "isRestricted", "restrictedUntil", "canPost", "canComment", "canMessage", "canFollow", "canLike"
@@ -4523,8 +4922,6 @@ function setCsrfCookie(res, req, token) {
 
 function verifyCsrf(req, res, next) {
     if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) return next();
-    const authHeader = req.headers['authorization'];
-    if (authHeader && authHeader.startsWith('Bearer ')) return next();
     const cookieToken = req.cookies?.csrf_token;
     const headerToken = req.headers['x-csrf-token'];
     if (!cookieToken) return next();
@@ -4640,428 +5037,6 @@ app.get('/api/socket/status', (req, res) => {
 });
 
 
-// =============================================================================
-// 💬 CHATSEE UYUMLULUK BLOGU
-// Frontend (public/chatsee/index.html) bu endpoint'leri çağırıyor.
-// Bu blok mevcut AgroLink auth route'larından ÖNCE tanımlanmıştır —
-// Express ilk eşleşen handler'ı kullanır.
-// =============================================================================
-
-// ── 1. GLOBAL MIDDLEWARE: display_name → name dönüşümü ───────────────────────
-// ChatSee register formu 'display_name' gönderir, AgroLink 'name' bekler.
-app.use((req, res, next) => {
-    if (req.body && typeof req.body === 'object') {
-        if (!req.body.name && req.body.display_name) {
-            req.body.name = req.body.display_name;
-        }
-    }
-    next();
-});
-
-// ── 2. POST /api/auth/register — 2FA & e-posta doğrulaması OLMADAN kayıt ──────
-// AgroLink'in orijinal /api/auth/register'ı e-posta kodu istiyor ve token dönmüyor.
-// Bu versiyon ChatSee için doğrudan token döndürür.
-app.post('/api/auth/register', registerLimiter, async (req, res, next) => {
-    // Sadece JSON body'si olan istekleri yakala (multipart/form-data olan
-    // AgroLink native app isteklerini geç)
-    const ct = req.headers['content-type'] || '';
-    if (ct.includes('multipart/form-data')) return next();
-
-    try {
-        const { name, display_name, username, email, password, userType } = req.body;
-        const finalName     = (name || display_name || '').trim();
-        const cleanUsername = (username || '').toLowerCase().replace(/[^a-z0-9._-]/g, '').trim();
-        const cleanEmail    = (email    || '').toLowerCase().trim();
-        const pwd           = (password || '');
-
-        // Zorunlu alan kontrolü
-        if (!finalName || !cleanUsername || !cleanEmail || !pwd) {
-            const missing = [];
-            if (!finalName)     missing.push('İsim');
-            if (!cleanUsername) missing.push('Kullanıcı adı');
-            if (!cleanEmail)    missing.push('E-posta');
-            if (!pwd)           missing.push('Şifre');
-            return res.status(400).json({ error: `Şu alanlar zorunlu: ${missing.join(', ')}` });
-        }
-
-        if (pwd.length < 8)
-            return res.status(400).json({ error: 'Şifre en az 8 karakter olmalı' });
-        if (cleanUsername.length < 3)
-            return res.status(400).json({ error: 'Kullanıcı adı en az 3 karakter olmalı' });
-
-        // Kullanıcı adı/e-posta çakışma kontrolü
-        const existing = await dbGet('SELECT id FROM users WHERE username=$1', [cleanUsername]);
-        if (existing) return res.status(409).json({ error: 'Bu kullanıcı adı zaten alınmış' });
-
-        const existingEmail = await dbGet('SELECT id FROM users WHERE email=$1', [cleanEmail]);
-        if (existingEmail) return res.status(409).json({ error: 'Bu e-posta adresi zaten kayıtlı' });
-
-        const hash   = await bcrypt.hash(pwd, BCRYPT_ROUNDS);
-        const userId = uuidv4();
-
-        const validUserTypes = ['tarim_ogretmeni','tarim_ogrencisi','ogretmen','ziraat_muhendisi','normal_kullanici','ciftci_hayvancilik'];
-        const finalUserType  = validUserTypes.includes(userType) ? userType : 'normal_kullanici';
-
-        await dbRun(
-            `INSERT INTO users
-             (id, name, username, email, password, "userType", "registrationIp",
-              "isOnline", "emailVerified", "twoFactorEnabled", "createdAt", "updatedAt")
-             VALUES ($1,$2,$3,$4,$5,$6,$7,FALSE,TRUE,FALSE,NOW(),NOW())`,
-            [userId, finalName, cleanUsername, cleanEmail, hash, finalUserType, req.ip || '']
-        );
-
-        const userObj = { id: userId, name: finalName, username: cleanUsername,
-                          email: cleanEmail, role: 'user', plan: 'free' };
-        const tokens  = generateTokens(userObj);
-        setAuthCookies(res, req, tokens);
-
-        const avatarUrl = `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(cleanUsername)}&backgroundColor=0a1628`;
-
-        return res.status(201).json({
-            success     : true,
-            token       : tokens.accessToken,
-            refreshToken: tokens.refreshToken,
-            user: {
-                id          : userId,
-                name        : finalName,
-                display_name: finalName,
-                username    : cleanUsername,
-                email       : cleanEmail,
-                profilePic  : avatarUrl,
-                avatar_url  : avatarUrl,
-                isVerified  : false,
-                role        : 'user',
-            },
-        });
-    } catch (e) {
-        console.error('[ChatSee] /api/auth/register:', e.message);
-        if (e.code === '23505') return res.status(409).json({ error: 'Bu kullanıcı adı veya e-posta zaten kayıtlı' });
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ── 3. POST /api/auth/login — 2FA OLMADAN giriş ───────────────────────────────
-// AgroLink'in orijinal login'i twoFactorEnabled=TRUE olan kullanıcılara
-// requires2FA:true döndürür. ChatSee frontend bunu işleyemiyor.
-// Bu versiyon 2FA olmadan doğrudan token döndürür.
-app.post('/api/auth/login', loginLimiter, async (req, res, next) => {
-    const ct = req.headers['content-type'] || '';
-    if (ct.includes('multipart/form-data')) return next();
-
-    try {
-        const { email, password, identifier, username } = req.body;
-        const loginId = (identifier || email || username || '').toLowerCase().trim();
-
-        if (!loginId || !password)
-            return res.status(400).json({ error: 'E-posta/kullanıcı adı ve şifre gerekli' });
-
-        const user = await dbGet(
-            `SELECT id, username, name, email, password, role, plan,
-                    "profilePic", "isVerified", "isActive", "isBanned",
-                    "hasFarmerBadge", "userType"
-             FROM users WHERE (email=$1 OR username=$1) AND "isActive"=TRUE`,
-            [loginId]
-        );
-
-        if (!user) return res.status(401).json({ error: 'Kullanıcı adı/e-posta veya şifre hatalı' });
-        if (user.isBanned) return res.status(403).json({ error: 'Bu hesap askıya alınmış' });
-
-        const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ error: 'Kullanıcı adı/e-posta veya şifre hatalı' });
-
-        // Online güncelle
-        await dbRun(
-            `UPDATE users SET "isOnline"=TRUE, "lastLogin"=NOW(), "updatedAt"=NOW() WHERE id=$1`,
-            [user.id]
-        );
-
-        const tokens = generateTokens(user);
-        setAuthCookies(res, req, tokens);
-
-        const picUrl = user.profilePic ? absoluteUrl(user.profilePic)
-            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(user.username)}&backgroundColor=0a1628`;
-
-        return res.json({
-            success     : true,
-            message     : 'Giriş başarılı',
-            token       : tokens.accessToken,
-            refreshToken: tokens.refreshToken,
-            user: {
-                id          : user.id,
-                name        : user.name,
-                display_name: user.name,
-                username    : user.username,
-                email       : user.email,
-                profilePic  : picUrl,
-                avatar_url  : picUrl,
-                isVerified  : user.isVerified,
-                hasFarmerBadge: user.hasFarmerBadge,
-                role        : user.role,
-            },
-        });
-    } catch (e) {
-        console.error('[ChatSee] /api/auth/login:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ── 4. GET /api/auth/me — Flat user objesi ────────────────────────────────────
-// AgroLink'in orijinali { user: {...} } döndürüyor.
-// ChatSee frontend'i flat obje bekliyor: currentUser.username, currentUser.avatar_url
-app.get('/api/auth/me', authenticateToken, async (req, res, next) => {
-    try {
-        const user = await dbGet(
-            `SELECT id, name, username, email, "profilePic", "isVerified",
-                    "hasFarmerBadge", role, plan, "isOnline"
-             FROM users WHERE id=$1 AND "isActive"=TRUE`,
-            [req.user.id]
-        );
-        if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
-
-        const picUrl = user.profilePic ? absoluteUrl(user.profilePic)
-            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(user.username)}&backgroundColor=0a1628`;
-
-        return res.json({
-            id          : user.id,
-            name        : user.name,
-            display_name: user.name,
-            username    : user.username,
-            email       : user.email,
-            profilePic  : picUrl,
-            avatar_url  : picUrl,
-            isVerified  : user.isVerified,
-            hasFarmerBadge: user.hasFarmerBadge,
-            role        : user.role,
-            plan        : user.plan,
-            isOnline    : user.isOnline,
-            // nested 'user' objesi de ekle (AgroLink native app uyumluluğu için)
-            user        : {
-                id: user.id, name: user.name, username: user.username, email: user.email,
-                profilePic: picUrl, coverPic: null, isVerified: user.isVerified,
-                hasFarmerBadge: user.hasFarmerBadge, role: user.role,
-            },
-        });
-    } catch (e) {
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ── 5. GET /api/conversations — ChatSee konuşma listesi ──────────────────────
-app.get('/api/conversations', authenticateToken, async (req, res) => {
-    try {
-        const uid = req.user.id;
-        const { rows } = await pool.query(`
-            SELECT
-                c.id, c.type,
-                c.name            AS group_name,
-                c.avatar_url,
-                c."updatedAt",
-                lm.content        AS last_message,
-                lm."createdAt"    AS last_message_at,
-                lm.sender_id      AS last_sender_id,
-                (
-                    SELECT COUNT(*)::int FROM chatsee_messages m2
-                    LEFT JOIN chatsee_reads r2 ON r2.message_id=m2.id AND r2.user_id=$1
-                    WHERE m2.conversation_id=c.id AND m2.sender_id!=$1
-                      AND m2.is_deleted=FALSE AND r2.message_id IS NULL
-                ) AS unread_count,
-                ou.id             AS other_id,
-                ou.name           AS other_name,
-                ou.username       AS other_username,
-                ou."profilePic"   AS other_pic,
-                ou."isOnline"     AS other_online,
-                ou."lastSeen"     AS other_last_seen
-            FROM chatsee_conversations c
-            JOIN chatsee_members cm ON cm.conversation_id=c.id AND cm.user_id=$1
-            LEFT JOIN LATERAL (
-                SELECT content,"createdAt",sender_id FROM chatsee_messages
-                WHERE conversation_id=c.id AND is_deleted=FALSE
-                ORDER BY "createdAt" DESC LIMIT 1
-            ) lm ON TRUE
-            LEFT JOIN LATERAL (
-                SELECT u.id,u.name,u.username,u."profilePic",u."isOnline",u."lastSeen"
-                FROM chatsee_members cm2
-                JOIN users u ON u.id=cm2.user_id
-                WHERE cm2.conversation_id=c.id AND cm2.user_id!=$1
-                LIMIT 1
-            ) ou ON c.type='direct'
-            ORDER BY COALESCE(lm."createdAt", c."createdAt") DESC
-        `, [uid]);
-
-        const av = (pic, seed) => pic ? absoluteUrl(pic)
-            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(seed||'u')}&backgroundColor=0a1628`;
-
-        res.json(rows.map(r => ({
-            id              : r.id,
-            type            : r.type,
-            name            : r.type === 'direct' ? r.other_name   : r.group_name,
-            username        : r.type === 'direct' ? r.other_username : null,
-            avatar_url      : r.type === 'direct' ? av(r.other_pic, r.other_username) : av(r.avatar_url, r.group_name),
-            profilePic      : r.type === 'direct' ? av(r.other_pic, r.other_username) : av(r.avatar_url, r.group_name),
-            isOnline        : r.type === 'direct' ? !!r.other_online : false,
-            lastSeen        : r.other_last_seen,
-            otherId         : r.other_id,
-            other_id        : r.other_id,
-            last_message    : r.last_message,
-            last_message_at : r.last_message_at,
-            lastMessage     : r.last_message,
-            lastMessageAt   : r.last_message_at,
-            unread_count    : parseInt(r.unread_count || 0),
-            unreadCount     : parseInt(r.unread_count || 0),
-            conversation_id : r.id,
-        })));
-    } catch (e) {
-        console.error('[ChatSee] /api/conversations:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ── 6. POST /api/conversations/direct ────────────────────────────────────────
-app.post('/api/conversations/direct', authenticateToken, async (req, res) => {
-    try {
-        const target = req.body.target_user_id || req.body.targetUserId;
-        if (!target) return res.status(400).json({ error: 'target_user_id gerekli' });
-        const myId = req.user.id;
-
-        const blocked = await pool.query(
-            `SELECT 1 FROM blocks WHERE ("blockerId"=$1 AND "blockedId"=$2) OR ("blockerId"=$2 AND "blockedId"=$1)`,
-            [myId, target]
-        );
-        if (blocked.rows.length) return res.status(403).json({ error: 'Bu kullanıcıyla mesajlaşamazsınız' });
-
-        const existing = await pool.query(`
-            SELECT c.id FROM chatsee_conversations c
-            JOIN chatsee_members m1 ON m1.conversation_id=c.id AND m1.user_id=$1
-            JOIN chatsee_members m2 ON m2.conversation_id=c.id AND m2.user_id=$2
-            WHERE c.type='direct' LIMIT 1
-        `, [myId, target]);
-
-        if (existing.rows.length)
-            return res.json({ conversation_id: existing.rows[0].id, conversationId: existing.rows[0].id, created: false });
-
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-            const convId = uuidv4();
-            await client.query(`INSERT INTO chatsee_conversations (id,type,created_by) VALUES ($1,'direct',$2)`, [convId, myId]);
-            await client.query(`INSERT INTO chatsee_members (conversation_id,user_id) VALUES ($1,$2),($1,$3)`, [convId, myId, target]);
-            await client.query('COMMIT');
-            return res.status(201).json({ conversation_id: convId, conversationId: convId, created: true });
-        } catch (err) {
-            await client.query('ROLLBACK'); throw err;
-        } finally { client.release(); }
-    } catch (e) {
-        console.error('[ChatSee] /api/conversations/direct:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ── 7. GET /api/conversations/:id/messages ────────────────────────────────────
-app.get('/api/conversations/:convId/messages', authenticateToken, async (req, res) => {
-    try {
-        const convId = req.params.convId;
-        const myId   = req.user.id;
-        const limit  = Math.min(parseInt(req.query.limit) || 50, 100);
-        const before = req.query.before || null;
-
-        const mem = await pool.query(
-            `SELECT 1 FROM chatsee_members WHERE conversation_id=$1 AND user_id=$2`,
-            [convId, myId]
-        );
-        if (!mem.rows.length) return res.status(403).json({ error: 'Erişim izniniz yok' });
-
-        const params = [convId, limit];
-        const cursor = before ? `AND m."createdAt" < $3` : '';
-        if (before) params.push(before);
-
-        const { rows } = await pool.query(`
-            SELECT m.id, m.conversation_id, m.sender_id, m.content, m.type,
-                   m.reply_to_id, m.is_deleted, m."createdAt",
-                   u.name AS sender_name, u.username AS sender_username,
-                   u."profilePic" AS sender_pic, u."isVerified" AS sender_verified,
-                   (SELECT JSON_AGG(r.user_id) FROM chatsee_reads r WHERE r.message_id=m.id) AS read_by
-            FROM chatsee_messages m
-            JOIN users u ON u.id=m.sender_id
-            WHERE m.conversation_id=$1 ${cursor}
-            ORDER BY m."createdAt" DESC LIMIT $2
-        `, params);
-
-        // Okundu işaretle
-        const unreadIds = rows.filter(r => r.sender_id !== myId).map(r => r.id);
-        if (unreadIds.length) {
-            pool.query(`INSERT INTO chatsee_reads (message_id,user_id,"readAt") SELECT unnest($1::uuid[]),$2,NOW() ON CONFLICT DO NOTHING`, [unreadIds, myId]).catch(() => {});
-        }
-
-        const av = (pic, seed) => pic ? absoluteUrl(pic)
-            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(seed||'u')}&backgroundColor=0a1628`;
-
-        res.json(rows.reverse().map(r => ({
-            id             : r.id,
-            conversation_id: r.conversation_id,
-            sender_id      : r.sender_id,
-            content        : r.content,
-            type           : r.type,
-            reply_to_id    : r.reply_to_id,
-            is_deleted     : r.is_deleted,
-            created_at     : r.createdAt,
-            read_by        : r.read_by || [],
-            sender: {
-                id        : r.sender_id,
-                name      : r.sender_name,
-                display_name: r.sender_name,
-                username  : r.sender_username,
-                avatar_url: av(r.sender_pic, r.sender_username),
-                profilePic: av(r.sender_pic, r.sender_username),
-                isVerified: r.sender_verified,
-            },
-        })));
-    } catch (e) {
-        console.error('[ChatSee] /api/conversations/:id/messages:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ── 8. GET /api/users/search?q= ───────────────────────────────────────────────
-app.get('/api/users/search', authenticateToken, async (req, res) => {
-    const q = (req.query.q || '').trim().toLowerCase();
-    if (q.length < 2) return res.json([]);
-    try {
-        const { rows } = await pool.query(`
-            SELECT u.id, u.name, u.username, u."profilePic",
-                   u."isOnline" AS status, u."lastSeen", u."isVerified", u."hasFarmerBadge"
-            FROM users u
-            WHERE (LOWER(u.username) LIKE $1 OR LOWER(u.name) LIKE $1)
-              AND u.id!=$2 AND u."isActive"=TRUE AND u."isBanned"=FALSE
-              AND NOT EXISTS (
-                  SELECT 1 FROM blocks b
-                  WHERE (b."blockerId"=$2 AND b."blockedId"=u.id)
-                     OR (b."blockerId"=u.id AND b."blockedId"=$2)
-              )
-            ORDER BY u."isOnline" DESC, u.username LIMIT 20
-        `, [`%${q}%`, req.user.id]);
-
-        res.json(rows.map(r => ({
-            id          : r.id,
-            name        : r.name,
-            display_name: r.name,
-            username    : r.username,
-            avatar_url  : r.profilePic ? absoluteUrl(r.profilePic)
-                          : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(r.username)}&backgroundColor=0a1628`,
-            profilePic  : r.profilePic ? absoluteUrl(r.profilePic) : null,
-            status      : r.status ? 'online' : 'offline',
-            isOnline    : !!r.status,
-            isVerified  : r.isVerified,
-            hasFarmerBadge: r.hasFarmerBadge,
-        })));
-    } catch (e) {
-        console.error('[ChatSee] /api/users/search:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// =============================================================================
-// END CHATSEE UYUMLULUK BLOGU
-// =============================================================================
 
 // ─── 1. HEALTH CHECK ────────────────────────────────────────────────
 app.get('/api/health', async (req, res) => {
@@ -5102,7 +5077,7 @@ app.post('/api/auth/register', registerLimiter, validateAuthInput, upload.single
             const filename = `profile_${userId}.webp`;
             const outputPath = path.join(profilesDir, filename);
             try {
-                await sharp(req.file.path).rotate().resize(512, 512, { fit: 'cover' }).webp({ quality: 85 }).toFile(outputPath);
+                await sharp(req.file.path).rotate().resize(300, 300, { fit: 'cover' }).webp({ quality: 55, effort: 1 }).toFile(outputPath);
                 profilePic = `/uploads/profiles/${filename}`;
             } catch (e) {
                 console.error('Profil resmi işleme hatası'); // 🔒 Detay loglanmıyor
@@ -5210,7 +5185,7 @@ app.post('/api/auth/register-init', registerLimiter, upload.single('profilePic')
             const filename = `profile_${userId}.webp`;
             const outputPath = path.join(profilesDir, filename);
             try {
-                await sharp(req.file.path).rotate().resize(512, 512, { fit: 'cover' }).webp({ quality: 85 }).toFile(outputPath);
+                await sharp(req.file.path).rotate().resize(300, 300, { fit: 'cover' }).webp({ quality: 55, effort: 1 }).toFile(outputPath);
                 profilePic = `/uploads/profiles/${filename}`;
             } catch (e) {
                 console.error('Profil resmi işleme hatası'); // 🔒 Detay loglanmıyor
@@ -5314,9 +5289,36 @@ app.post('/api/auth/login', loginLimiter, validateAuthInput, async (req, res) =>
         const validPassword = await bcrypt.compare(password, user.password);
         if (!validPassword) {
             recordFailedLogin(loginId);
-            return res.status(401).json({ error: 'Şifre yanlış' });
+            return res.status(401).json({ error: 'E-posta/kullanıcı adı veya şifre hatalı' });
         }
         clearFailedLogins(loginId);
+
+        // 🔒 BAN KONTROLÜ — Banlı kullanıcı login olabilir ama isBanned:true ile bilgilendirilir
+        // Frontend bu flag'i alınca profili 3 sn gösterir sonra erişim engeli modal açar
+        if (user.isBanned) {
+            const tokens = generateTokens(user);
+            const tokenHash = crypto.createHash('sha256').update(tokens.refreshToken).digest('hex');
+            await dbRun(
+                `INSERT INTO refresh_tokens (id, "userId", "tokenHash", ip, "userAgent", "createdAt", "expiresAt")
+                 VALUES ($1, $2, $3, $4, $5, NOW(), NOW() + INTERVAL '7 days')`,
+                [uuidv4(), user.id, tokenHash, req.ip, req.headers['user-agent'] || '']
+            );
+            const csrfToken = generateCsrfToken();
+            setAuthCookies(res, req, tokens);
+            setCsrfCookie(res, req, csrfToken);
+            return res.json({
+                message: 'Giriş başarılı',
+                token: tokens.accessToken,
+                refreshToken: tokens.refreshToken,
+                isBanned: true,
+                user: {
+                    id: user.id, username: user.username, name: user.name, email: user.email,
+                    profilePic: absoluteUrl(user.profilePic), coverPic: absoluteUrl(user.coverPic),
+                    bio: user.bio, isVerified: user.isVerified, hasFarmerBadge: user.hasFarmerBadge,
+                    role: user.role, isBanned: true
+                }
+            });
+        }
 
         // ========== 2FA KONTROLÜ ==========
         if (user.twoFactorEnabled) {
@@ -5373,6 +5375,9 @@ app.post('/api/auth/login', loginLimiter, validateAuthInput, async (req, res) =>
         sendLoginNotificationEmail(user.email, user.name, req).catch(() => {});
 
         await dbRun('UPDATE users SET "lastLogin" = NOW(), "isOnline" = TRUE, "updatedAt" = NOW() WHERE id = $1', [user.id]);
+        // 📊 Giriş saati kaydı — akıllı bildirim zamanlama için
+        dbRun(`INSERT INTO user_login_hours ("userId", hour) VALUES ($1, $2)`,
+            [user.id, new Date().getHours()]).catch(() => {});
 
         await dbRun(
             `INSERT INTO login_history (id, "userId", ip, "userAgent", "createdAt")
@@ -5397,6 +5402,8 @@ app.post('/api/auth/login', loginLimiter, validateAuthInput, async (req, res) =>
         res.json({
             message: 'Giriş başarılı',
             token: tokens.accessToken,       // backward compat (mobile/native)
+            // 🔒 Mobile backward compat: cookie'yi okuyamayan native app için
+            // Tarayıcı istemcileri için HttpOnly cookie kullanın
             refreshToken: tokens.refreshToken,
             user: {
                 id: user.id, username: user.username, name: user.name, email: user.email,
@@ -5535,6 +5542,8 @@ app.post('/api/auth/verify-otp', otpLimiter, validateAuthInput, async (req, res)
             );
             if (!user) return res.status(401).json({ error: 'Kullanıcı bulunamadı' });
             await dbRun('UPDATE users SET "lastLogin" = NOW(), "isOnline" = TRUE, "updatedAt" = NOW() WHERE id = $1', [user.id]);
+            dbRun(`INSERT INTO user_login_hours ("userId", hour) VALUES ($1, $2)`,
+                [user.id, new Date().getHours()]).catch(() => {});
             const tokens = generateTokens(user);
             const tokenHash = crypto.createHash('sha256').update(tokens.refreshToken).digest('hex');
             await dbRun(
@@ -5624,7 +5633,7 @@ app.get('/api/users/:idOrUsername', authenticateToken, async (req, res, next) =>
             // ID ile ara (v5 uyumlu)
             user = await dbGet(
                 `SELECT id, username, name, "profilePic", "coverPic", bio, location, website,
-                        "isVerified", "hasFarmerBadge", "userType", "isOnline", "lastSeen", "createdAt"
+                        "isVerified", "hasFarmerBadge", "userType", "isOnline", "lastSeen", "createdAt", "isBanned"
                  FROM users WHERE id = $1 AND "isActive" = TRUE`,
                 [param]
             );
@@ -5632,13 +5641,47 @@ app.get('/api/users/:idOrUsername', authenticateToken, async (req, res, next) =>
             // Username ile ara
             user = await dbGet(
                 `SELECT id, username, name, "profilePic", "coverPic", bio, location, website,
-                        "isVerified", "hasFarmerBadge", "userType", "isOnline", "lastSeen", "createdAt"
+                        "isVerified", "hasFarmerBadge", "userType", "isOnline", "lastSeen", "createdAt", "isBanned"
                  FROM users WHERE username = $1 AND "isActive" = TRUE`,
                 [param.toLowerCase()]
             );
         }
 
         if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
+
+        // 🔒 Banlı kullanıcının kendi profiline baktığı durum:
+        // Profil verisini döndür ama isBanned:true ile işaretle
+        // Frontend 3 sn gösterip sonra erişim engeli modal açar
+        if (user.isBanned && req.user.id === user.id) {
+            return res.json({
+                user: {
+                    id: user.id, username: user.username, name: user.name,
+                    profilePic: absoluteUrl(user.profilePic), coverPic: absoluteUrl(user.coverPic),
+                    bio: user.bio, isVerified: user.isVerified, hasFarmerBadge: user.hasFarmerBadge,
+                    userType: user.userType, createdAt: user.createdAt,
+                    followingCount: 0, followerCount: 0, postCount: 0,
+                    isFollowing: false, isBlocked: false, isOnline: false,
+                    isBanned: true,
+                },
+                bannedProfile: true
+            });
+        }
+
+        // 🔒 Başka birinin banlı profilini ziyaret ediyorsa: isim maskele
+        if (user.isBanned) {
+            return res.json({
+                user: {
+                    id: user.id, username: user.username,
+                    name: 'Erişim Engeli - Politika İhlali',
+                    profilePic: absoluteUrl(user.profilePic), coverPic: null,
+                    bio: null, isVerified: false, hasFarmerBadge: false,
+                    userType: user.userType, createdAt: user.createdAt,
+                    followingCount: 0, followerCount: 0, postCount: 0,
+                    isFollowing: false, isBlocked: false, isOnline: false,
+                    isBanned: true,
+                }
+            });
+        }
 
         const [followingRow, followerRow, postRow, isFollowing, isBlocked, onlineRow] = await Promise.all([
             pool.query('SELECT COUNT(*)::int AS cnt FROM follows WHERE "followerId"  = $1', [user.id]),
@@ -5676,6 +5719,21 @@ app.get('/api/users/:idOrUsername', authenticateToken, async (req, res, next) =>
         res.status(500).json({ error: 'Sunucu hatası' });
     }
 });
+
+// ════════════════════════════════════════════════════════════════════
+// 🔒 BANNED KULLANICI BLOKLAMA MİDDLEWARE
+// authenticateToken'dan sonra hassas endpoint'lere ekle
+// ════════════════════════════════════════════════════════════════════
+function requireNotBanned(req, res, next) {
+    if (req.user?.isBanned) {
+        return res.status(403).json({
+            error: 'Erişim Engeli',
+            code: 'ACCOUNT_BANNED',
+            message: 'Hesabınız politika ihlali nedeniyle kısıtlanmıştır.'
+        });
+    }
+    next();
+}
 
 // isUserOnline yardımcı fonksiyonu (yok ise fallback)
 async function isUserOnline(userId) {
@@ -5716,8 +5774,8 @@ app.put('/api/users/profile', authenticateToken, upload.fields([
                 const outputPath = path.join(profilesDir, filename);
                 await sharp(file.path, { sequentialRead: true })
                     .rotate()
-                    .resize(512, 512, { fit: 'cover', kernel: 'lanczos2' })
-                    .webp({ quality: 82, effort: 2 }) // ⚡ effort:2 → hızlı
+                    .resize(300, 300, { fit: 'cover', kernel: 'lanczos2' })
+                    .webp({ quality: 55, effort: 1 }) // ⚡ küçük boyut → düşük kalite
                     .toFile(outputPath);
                 await fs.unlink(file.path).catch(() => {});
                 updates.push(`"profilePic" = $${paramIdx++}`);
@@ -5764,6 +5822,9 @@ app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
         const { currentPassword, newPassword } = req.body;
         if (!currentPassword || !newPassword) return res.status(400).json({ error: 'Şifreler gerekli' });
         if (newPassword.length < 8) return res.status(400).json({ error: 'Yeni şifre en az 8 karakter olmalıdır' });
+        // 🔒 Şifre güvenlik kontrolü — eski şifreyle aynı olmamalı
+        const sameAsCurrent = await bcrypt.compare(newPassword, user.password);
+        if (sameAsCurrent) return res.status(400).json({ error: 'Yeni şifre eskisiyle aynı olamaz' });
 
         const user = await dbGet('SELECT password FROM users WHERE id = $1', [req.user.id]);
         const valid = await bcrypt.compare(currentPassword, user.password);
@@ -5771,6 +5832,15 @@ app.put('/api/auth/change-password', authenticateToken, async (req, res) => {
 
         const hashed = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
         await dbRun('UPDATE users SET password = $1, "updatedAt" = NOW() WHERE id = $2', [hashed, req.user.id]);
+
+        // 🔒 GÜVENLİK: Şifre değişince tüm mevcut oturumları sonlandır
+        // Çalınmış token / aktif oturum saldırısını engeller
+        await dbRun(
+            `UPDATE refresh_tokens SET "isActive" = FALSE WHERE "userId" = $1`,
+            [req.user.id]
+        );
+        // Mevcut access token'ı da blacklist'e ekle
+        if (req._token) await blacklistToken(req._token);
 
         // 📧 Bildirim e-postası
         const u = await dbGet('SELECT email, name FROM users WHERE id = $1', [req.user.id]);
@@ -5790,7 +5860,7 @@ app.get('/api/users/search/:query', authenticateToken, async (req, res) => {
         const searchTerm = `%${query.toLowerCase()}%`;
 
         const users = await dbAll(
-            `SELECT id, username, name, "profilePic", "isVerified", "hasFarmerBadge"
+            `SELECT id, username, name, "profilePic", "isVerified", "hasFarmerBadge", "isBanned"
              FROM users
              WHERE "isActive" = TRUE AND (LOWER(username) LIKE $1 OR LOWER(name) LIKE $1)
              ORDER BY "isVerified" DESC, "createdAt" DESC
@@ -5798,7 +5868,16 @@ app.get('/api/users/search/:query', authenticateToken, async (req, res) => {
             [searchTerm]
         );
 
-        res.json({ users: users.map(u => ({ ...u, profilePic: absoluteUrl(u.profilePic) })) });
+        res.json({
+            users: users.map(u => ({
+                ...u,
+                profilePic : absoluteUrl(u.profilePic),
+                // 🔒 Banlı kullanıcı: isim/soyisim maskelenir, username görünür kalır
+                name       : u.isBanned ? 'Erişim Engeli - Politika İhlali' : u.name,
+                bio        : u.isBanned ? null : u.bio,
+                isBanned   : !!u.isBanned,
+            }))
+        });
     } catch (error) {
         console.error('Arama hatası:', error);
         res.status(500).json({ error: 'Sunucu hatası' });
@@ -6018,6 +6097,18 @@ app.post('/api/upload/chunk/:uploadId/finalize', authenticateToken, async (req, 
         const rawServedPath = path.join(videosDir, `${videoId}_raw.mp4`);
         await fs.rename(finalPath, rawServedPath);
 
+        // 🔒 GÜVENLİK: Birleştirilen videoyu da magic-bytes + derin tarama ile doğrula
+        try {
+            await verifyUploadedFile(
+                { path: rawServedPath, mimetype: 'video/mp4', size: (await fs.stat(rawServedPath)).size },
+                'postVideo',
+                session.videoLimit || UPLOAD_LIMITS.postVideo
+            );
+        } catch (verifyErr) {
+            await fs.unlink(rawServedPath).catch(() => {});
+            return res.status(400).json({ error: `Güvenlik kontrolü başarısız: ${verifyErr.message}` });
+        }
+
         const rawUrl = absoluteUrl(`/uploads/videos/${videoId}_raw.mp4`);
 
         res.json({
@@ -6210,6 +6301,31 @@ app.post('/api/posts', authenticateToken, checkRestriction('post'), upload.array
             }
         }
 
+        // ⚡ @Mention bildirimleri — gönderi içindeki @kullanıcı etiketleri
+        if (content) {
+            const mentionMatches = content.match(/@([\w.]+)/g);
+            if (mentionMatches) {
+                const uniqueMentions = [...new Set(mentionMatches.map(m => m.slice(1).toLowerCase()))];
+                setImmediate(async () => {
+                    for (const uname of uniqueMentions.slice(0, 10)) { // max 10 mention/gönderi
+                        if (uname === req.user.username.toLowerCase()) continue; // kendini etiketleme
+                        const mentioned = await dbGet(
+                            'SELECT id FROM users WHERE LOWER(username) = $1 AND "isActive" = TRUE', [uname]
+                        ).catch(() => null);
+                        if (mentioned) {
+                            createNotification(mentioned.id, 'mention',
+                                `${req.user.username} sizi bir gönderide etiketledi`, {
+                                    postId,
+                                    actorName      : req.user.name || req.user.username,
+                                    actorUsername  : req.user.username,
+                                    actorProfilePic: req.user.profilePic || '',
+                                });
+                        }
+                    }
+                });
+            }
+        }
+
         // ⚡ Hashtag'leri PARALEL işle
         if (content) {
             const hashtagMatches = content.match(/#[\wığüşöçĞÜŞÖÇİ]+/g);
@@ -6365,13 +6481,63 @@ app.get('/api/posts/:id', authenticateToken, async (req, res, next) => {
 // ─── 13. POST SİL ──────────────────────────────────────────────────
 app.delete('/api/posts/:id', authenticateToken, async (req, res) => {
     try {
-        const post = await dbGet('SELECT "userId" FROM posts WHERE id = $1', [req.params.id]);
+        const post = await dbGet(
+            'SELECT "userId", media, "mediaUrls", "thumbnailUrl" FROM posts WHERE id = $1',
+            [req.params.id]
+        );
         if (!post) return res.status(404).json({ error: 'Gönderi bulunamadı' });
         if (post.userId !== req.user.id && req.user.role !== 'admin') {
             return res.status(403).json({ error: 'Yetkiniz yok' });
         }
+
         await dbRun('UPDATE posts SET "isActive" = FALSE, "updatedAt" = NOW() WHERE id = $1', [req.params.id]);
         res.json({ message: 'Gönderi silindi' });
+
+        // Medya dosyalarını arka planda sil (yanıtı bloke etme)
+        setImmediate(async () => {
+            try {
+                const toDelete = new Set();
+
+                // Tek medya
+                if (post.media) {
+                    const rel = post.media.replace(/^https?:\/\/[^/]+/, '');
+                    if (rel.startsWith('/uploads/')) {
+                        toDelete.add(path.join(__dirname, 'public', rel));
+                    }
+                }
+                // Thumbnail
+                if (post.thumbnailUrl) {
+                    const rel = post.thumbnailUrl.replace(/^https?:\/\/[^/]+/, '');
+                    if (rel.startsWith('/uploads/')) {
+                        toDelete.add(path.join(__dirname, 'public', rel));
+                    }
+                }
+                // Çoklu medya
+                if (post.mediaUrls) {
+                    try {
+                        const items = typeof post.mediaUrls === 'string'
+                            ? JSON.parse(post.mediaUrls) : post.mediaUrls;
+                        if (Array.isArray(items)) {
+                            for (const item of items) {
+                                const rel = (item.url || '').replace(/^https?:\/\/[^/]+/, '');
+                                if (rel.startsWith('/uploads/')) {
+                                    toDelete.add(path.join(__dirname, 'public', rel));
+                                }
+                            }
+                        }
+                    } catch (_) {}
+                }
+
+                for (const filePath of toDelete) {
+                    await require('fs').promises.unlink(filePath).catch(() => {});
+                }
+                if (toDelete.size > 0) {
+                    console.log(`🗑️  [Post Sil] ${toDelete.size} medya dosyası silindi (postId: ${req.params.id})`);
+                }
+            } catch (e) {
+                console.error('[Post Sil] Dosya temizleme hatası:', e.message);
+            }
+        });
     } catch (error) {
         console.error('Post silme hatası:', error);
         res.status(500).json({ error: 'Sunucu hatası' });
@@ -6392,6 +6558,19 @@ app.get('/api/users/:userId/posts', authenticateToken, async (req, res) => {
             const u = await dbGet('SELECT id FROM users WHERE username=$1 AND "isActive"=TRUE', [param.toLowerCase()]);
             if (!u) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
             targetUserId = u.id;
+        }
+
+        // 🔒 GİZLİ HESAP — takipçi değilse post listesi boş döner
+        if (targetUserId !== req.user.id) {
+            const owner = await dbGet(
+                `SELECT "isPrivate", EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"
+                 FROM users WHERE id=$2`,
+                [req.user.id, targetUserId]
+            );
+            if (owner?.isPrivate && !owner?.isFollowing) {
+                console.log(`[GİZLİ HESAP] userId=${req.user.id} → post listesi engellendi (hedef=${targetUserId})`);
+                return res.json({ posts: [], total: 0, page: parseInt(page), isPrivate: true });
+            }
         }
 
         const posts = await dbAll(
@@ -6479,6 +6658,30 @@ app.post('/api/posts/:id/comments', authenticateToken, checkRestriction('comment
             });
         }
 
+        // @mention bildirimleri — yorum içindeki etiketler
+        const commentMentions = content.match(/@([\w.]+)/g);
+        if (commentMentions) {
+            const uniqueMentions = [...new Set(commentMentions.map(m => m.slice(1).toLowerCase()))];
+            setImmediate(async () => {
+                for (const uname of uniqueMentions.slice(0, 5)) {
+                    if (uname === req.user.username.toLowerCase()) continue;
+                    const mentioned = await dbGet(
+                        'SELECT id FROM users WHERE LOWER(username) = $1 AND "isActive" = TRUE', [uname]
+                    ).catch(() => null);
+                    if (mentioned && mentioned.id !== post.userId) { // post sahibi zaten bildirim aldı
+                        createNotification(mentioned.id, 'mention',
+                            `${req.user.username} bir yorumda sizi etiketledi`, {
+                                postId: req.params.id,
+                                commentId,
+                                actorName      : req.user.name || req.user.username,
+                                actorUsername  : req.user.username,
+                                actorProfilePic: req.user.profilePic || '',
+                            });
+                    }
+                }
+            });
+        }
+
         const comment = await dbGet('SELECT * FROM comments WHERE id = $1', [commentId]);
         res.status(201).json({ comment });
     } catch (error) {
@@ -6544,6 +6747,19 @@ app.post('/api/users/:id/follow', authenticateToken, checkRestriction('follow'),
 // ─── 19. TAKİPÇİLER ────────────────────────────────────────────────
 app.get('/api/users/:id/followers', authenticateToken, async (req, res) => {
     try {
+        // 🔒 GİZLİ HESAP — takipçi değilse liste boş döner
+        const isSelf = req.params.id === req.user.id;
+        if (!isSelf) {
+            const owner = await dbGet(
+                `SELECT "isPrivate", EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"
+                 FROM users WHERE id=$2`,
+                [req.user.id, req.params.id]
+            );
+            if (owner?.isPrivate && !owner?.isFollowing) {
+                console.log(`[GİZLİ HESAP] userId=${req.user.id} → takipçi listesi engellendi (hedef=${req.params.id})`);
+                return res.json({ followers: [], isPrivate: true });
+            }
+        }
         const followers = await dbAll(
             `SELECT u.id, u.username, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge",
                     EXISTS(SELECT 1 FROM follows WHERE "followerId" = $2 AND "followingId" = u.id) as "isFollowing"
@@ -6563,6 +6779,19 @@ app.get('/api/users/:id/followers', authenticateToken, async (req, res) => {
 // ─── 20. TAKİP EDİLENLER ───────────────────────────────────────────
 app.get('/api/users/:id/following', authenticateToken, async (req, res) => {
     try {
+        // 🔒 GİZLİ HESAP — takipçi değilse liste boş döner
+        const isSelf = req.params.id === req.user.id;
+        if (!isSelf) {
+            const owner = await dbGet(
+                `SELECT "isPrivate", EXISTS(SELECT 1 FROM follows WHERE "followerId"=$1 AND "followingId"=$2) AS "isFollowing"
+                 FROM users WHERE id=$2`,
+                [req.user.id, req.params.id]
+            );
+            if (owner?.isPrivate && !owner?.isFollowing) {
+                console.log(`[GİZLİ HESAP] userId=${req.user.id} → takip listesi engellendi (hedef=${req.params.id})`);
+                return res.json({ following: [], isPrivate: true });
+            }
+        }
         const following = await dbAll(
             `SELECT u.id, u.username, u.name, u."profilePic", u."isVerified", u."hasFarmerBadge",
                     EXISTS(SELECT 1 FROM follows WHERE "followerId" = $2 AND "followingId" = u.id) as "isFollowing"
@@ -6580,7 +6809,18 @@ app.get('/api/users/:id/following', authenticateToken, async (req, res) => {
 });
 
 // ─── 21. MESAJ GÖNDER ───────────────────────────────────────────────
-app.post('/api/messages', authenticateToken, checkRestriction('message'), async (req, res) => {
+// 🔒 Mesaj rate limit — kullanıcı başına dakikada max 30 mesaj (flood/spam koruması)
+const messageLimiter = rateLimit({
+    windowMs: 60 * 1000, // 1 dakika
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req, res) => req.user?.id || rateLimit.ipKeyGenerator(req, res),
+    message: { error: 'Çok hızlı mesaj gönderiyorsunuz. Lütfen bir dakika bekleyin.' },
+    skip: (req) => process.env.NODE_ENV === 'test',
+});
+
+app.post('/api/messages', authenticateToken, messageLimiter, checkRestriction('message'), async (req, res) => {
     try {
         const { recipientId, content } = req.body;
         if (!recipientId || !content) return res.status(400).json({ error: 'Alıcı ve mesaj gerekli' });
@@ -7187,13 +7427,14 @@ app.post('/api/auth/forgot-password', forgotPasswordLimiter, validateAuthInput, 
         // ✅ Eski tokenları temizle
         await pool.query(`DELETE FROM password_resets WHERE "userId" = $1`, [user.id]).catch(() => {});
 
-        const token = crypto.randomBytes(32).toString('hex');
+        const token     = crypto.randomBytes(32).toString('hex');  // e-postaya gidecek ham token
+        const tokenHash = crypto.createHash('sha256').update(token).digest('hex'); // DB'de saklanacak hash
 
         // ✅ PostgreSQL interval ile kaydet (timezone sorunu yok)
         await dbRun(
             `INSERT INTO password_resets (id, "userId", token, "expiresAt")
              VALUES ($1, $2, $3, NOW() + INTERVAL '10 minutes')`,
-            [uuidv4(), user.id, token]
+            [uuidv4(), user.id, tokenHash]
         );
         console.log(`🔑 Şifre sıfırlama token'ı oluşturuldu: ${maskEmail(user.email)} - Süre: 10 dakika`);
 
@@ -7224,11 +7465,12 @@ app.post('/api/auth/reset-password', validateAuthInput, async (req, res) => {
         const { token, newPassword, confirmPassword } = req.body;
         if (!token || !newPassword || !confirmPassword) return res.status(400).json({ error: 'Tüm alanlar zorunludur' });
         if (newPassword !== confirmPassword) return res.status(400).json({ error: 'Şifreler eşleşmiyor' });
-        if (newPassword.length < 6) return res.status(400).json({ error: 'Şifre en az 6 karakter olmalı' });
+        if (newPassword.length < 8) return res.status(400).json({ error: 'Şifre en az 8 karakter olmalı' });
 
+        const incomingHash = crypto.createHash('sha256').update(token).digest('hex');
         const record = await dbGet(
             `SELECT * FROM password_resets WHERE token = $1 AND used = FALSE AND "expiresAt" > NOW()`,
-            [token]
+            [incomingHash]
         );
         if (!record) return res.status(400).json({ error: 'Geçersiz veya süresi dolmuş token' });
 
@@ -7251,6 +7493,7 @@ app.post('/api/auth/reset-password', validateAuthInput, async (req, res) => {
 app.get('/api/auth/verify-reset-token', async (req, res) => {
     try {
         const { token, username } = req.query;
+        const tokenHash = token ? crypto.createHash('sha256').update(token).digest('hex') : null;
         if (!token) return res.status(400).json({ error: 'Token gerekli' });
 
         let record;
@@ -7267,14 +7510,14 @@ app.get('/api/auth/verify-reset-token', async (req, res) => {
             record = await dbGet(
                 `SELECT "expiresAt" FROM password_resets
                  WHERE token = $1 AND "userId" = $2 AND used = FALSE AND "expiresAt" > NOW()`,
-                [token, user.id]
+                [tokenHash, user.id]
             );
         } else {
             // Sadece token ile doğrulama
             record = await dbGet(
                 `SELECT "expiresAt" FROM password_resets
                  WHERE token = $1 AND used = FALSE AND "expiresAt" > NOW()`,
-                [token]
+                [tokenHash]
             );
         }
 
@@ -7577,6 +7820,57 @@ app.get('/api/videos/:videoId/hls-status', authenticateToken, (req, res) => {
         });
     }
     res.json({ ready: false, activeVideoJobs: activeVideoJobs, message: 'HLS henüz işleniyor, MP4 ile oynat' });
+});
+
+// ─── HLS→MP4 MİGRASYON: Eski m3u8 URL'li gönderileri mp4'e çevir ──────
+// Kullanım: POST /api/admin-fix-hls-to-mp4  (Postman ile 1 kez çalıştır, admin token ile)
+app.post('/api/admin-fix-hls-to-mp4', authenticateToken, async (req, res) => {
+    try {
+        const user = await dbGet('SELECT role FROM users WHERE id = $1', [req.user.id]);
+        if (!user || user.role !== 'admin') return res.status(403).json({ error: 'Yetki yok' });
+
+        const hlsPosts = await pool.query(
+            `SELECT id, media FROM posts WHERE media LIKE '%/hls/%' AND media LIKE '%.m3u8'`
+        );
+
+        let fixed = 0, notFound = 0;
+        for (const post of hlsPosts.rows) {
+            const m = post.media.match(/\/hls\/([^/]+)\/master\.m3u8/);
+            if (!m) continue;
+            const videoId = m[1];
+            const mp4Path = path.join(videosDir, `${videoId}.mp4`);
+
+            if (fssync.existsSync(mp4Path)) {
+                await dbRun(
+                    `UPDATE posts SET media = $1, "updatedAt" = NOW() WHERE id = $2`,
+                    [`/uploads/videos/${videoId}.mp4`, post.id]
+                );
+                fixed++;
+            } else {
+                const rawPath = path.join(videosDir, `${videoId}_raw.mp4`);
+                if (fssync.existsSync(rawPath)) {
+                    await dbRun(
+                        `UPDATE posts SET media = $1, "updatedAt" = NOW() WHERE id = $2`,
+                        [`/uploads/videos/${videoId}_raw.mp4`, post.id]
+                    );
+                    fixed++;
+                } else {
+                    notFound++;
+                }
+            }
+        }
+
+        res.json({
+            success: true,
+            total: hlsPosts.rows.length,
+            fixed,
+            notFound,
+            message: `${fixed} gönderi MP4'e güncellendi. ${notFound} gönderi için MP4 bulunamadı.`
+        });
+    } catch (e) {
+        console.error('[HLS-Fix] Hata:', e.message);
+        res.status(500).json({ error: 'Migrasyon hatası' });
+    }
 });
 
 // ─── YENİ ROTA 11: YORUM GÜNCELLE ──────────────────────────────────
@@ -8312,7 +8606,7 @@ app.delete('/api/auth/account', authenticateToken, async (req, res) => {
 
         const user = await dbGet('SELECT password FROM users WHERE id = $1', [req.user.id]);
         const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ error: 'Şifre yanlış' });
+        if (!valid) return res.status(401).json({ error: 'E-posta/kullanıcı adı veya şifre hatalı' });
 
         await dbRun('UPDATE users SET "isActive" = FALSE, "updatedAt" = NOW() WHERE id = $1', [req.user.id]);
         await dbRun('UPDATE refresh_tokens SET "isActive" = FALSE WHERE "userId" = $1', [req.user.id]);
@@ -9278,6 +9572,135 @@ ${coverUrl ? `<img class="cover" src="${coverUrl}" alt="kapak">` : '<div class="
     }
 });
 
+// Gönderi paylaşım sayfası: /post/:postId (tam handler — redirect değil, direkt HTML)
+app.get('/post/:postId', async (req, res) => {
+    const DOMAIN = process.env.APP_URL || 'https://sehitumitkestitarimmtal.com';
+    try {
+        const postId = req.params.postId?.trim();
+        if (!postId) return res.redirect('/');
+
+        const post = await dbGet(
+            `SELECT p.id, p.content, p.media, p."mediaType", p."mediaUrls",
+                    p."likeCount", p."commentCount", p."createdAt",
+                    u.name, u.username, u."profilePic", u."isVerified"
+             FROM posts p JOIN users u ON p."userId"=u.id
+             WHERE p.id=$1 AND p."isActive"=TRUE LIMIT 1`,
+            [postId]
+        ).catch(() => null);
+
+        if (!post) {
+            return res.status(404).send(`<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8">
+<title>Gönderi Bulunamadı • AgroLink</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',sans-serif;background:#060d0a;color:#e8f5e9;display:flex;align-items:center;justify-content:center;min-height:100vh}
+.box{text-align:center;padding:40px}.logo{font-size:28px;font-weight:800;color:#00e676;margin-bottom:16px}
+p{color:rgba(255,255,255,0.5);margin-bottom:24px}a{display:inline-block;padding:12px 28px;background:#00e676;color:#020810;border-radius:50px;text-decoration:none;font-weight:700}
+</style></head><body><div class="box"><div class="logo">🌾 AgroLink</div><h2>Gönderi bulunamadı</h2>
+<p>Bu gönderi silinmiş veya mevcut değil.</p><a href="${DOMAIN}">Ana Sayfaya Dön</a></div></body></html>`);
+        }
+
+        let mediaItems = [];
+        if (post.mediaUrls) {
+            try {
+                const arr = typeof post.mediaUrls === 'string' ? JSON.parse(post.mediaUrls) : post.mediaUrls;
+                mediaItems = (arr||[]).map(item => {
+                    const url = item?.url || (typeof item === 'string' ? item : null);
+                    if (!url) return null;
+                    return { url: url.startsWith('http') ? url : DOMAIN + url, type: item?.type || post.mediaType || 'image' };
+                }).filter(Boolean);
+            } catch {}
+        }
+        if (!mediaItems.length && post.media)
+            mediaItems = [{ url: post.media.startsWith('http') ? post.media : DOMAIN + post.media, type: post.mediaType || 'image' }];
+
+        const profPic  = post.profilePic ? (post.profilePic.startsWith('http') ? post.profilePic : DOMAIN + post.profilePic) : `${DOMAIN}/agro.png`;
+        const first    = mediaItems[0];
+        const ogImg    = (first?.type === 'image' ? first.url : null) || profPic;
+        const title    = `${post.name || post.username} (@${post.username}) • AgroLink`;
+        const rawDesc  = (post.content||'').replace(/<[^>]*>/g,'').substring(0,200);
+        const desc     = rawDesc || 'AgroLink Tarım Topluluğu paylaşımı';
+        const pageUrl  = `${DOMAIN}/post/${post.id}`;
+        const profUrl  = `${DOMAIN}/u/${post.username}`;
+        const badge    = post.isVerified ? ' ✓' : '';
+        const diff     = Date.now() - new Date(post.createdAt).getTime();
+        const m        = Math.floor(diff/60000);
+        const timeAgo  = m<1?'Az önce':m<60?m+' dk önce':m<1440?Math.floor(m/60)+' saat önce':Math.floor(m/1440)+' gün önce';
+        const mediaHtml = mediaItems.map(item =>
+            item.type==='video'
+            ? `<video controls style="width:100%;max-height:480px;background:#000;display:block" src="${item.url}"></video>`
+            : `<img src="${item.url}" alt="görsel" style="width:100%;display:block;max-height:580px;object-fit:cover">`
+        ).join('');
+
+        res.setHeader('Cache-Control', 'public, max-age=120');
+        res.type('html').send(`<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<meta name="description" content="${desc}">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="AgroLink">
+<meta property="og:title" content="${title}">
+<meta property="og:description" content="${desc}">
+<meta property="og:image" content="${ogImg}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:url" content="${pageUrl}">
+<meta property="og:locale" content="tr_TR">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="${title}">
+<meta name="twitter:description" content="${desc}">
+<meta name="twitter:image" content="${ogImg}">
+<link rel="canonical" href="${pageUrl}">
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Segoe UI',Arial,sans-serif;background:#060d0a;color:#e8f5e9;min-height:100vh}
+.wrap{max-width:600px;margin:0 auto;padding:16px 16px 56px}
+.topbar{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.brand{font-size:21px;font-weight:800;color:#00e676}
+.card{background:#0d1a12;border:1px solid rgba(0,230,118,0.12);border-radius:20px;overflow:hidden}
+.author{display:flex;align-items:center;gap:12px;padding:14px 16px}
+.avatar{width:44px;height:44px;border-radius:50%;object-fit:cover;border:2px solid #00e676;flex-shrink:0}
+.aname{font-weight:700;font-size:15px;color:#e8f5e9}
+.ausr{color:#00e676;font-size:13px}
+.media-wrap{overflow:hidden}
+.body{padding:14px 16px;font-size:15px;line-height:1.65;color:#e8f5e9;white-space:pre-wrap;word-break:break-word}
+.stats{display:flex;gap:20px;padding:10px 16px;border-top:1px solid rgba(0,230,118,0.08);color:rgba(255,255,255,0.45);font-size:13px}
+.stats strong{color:#e8f5e9}
+.time{padding:4px 16px 14px;color:rgba(255,255,255,0.3);font-size:12px}
+.cta-area{text-align:center;margin-top:20px}
+.cta{display:inline-block;padding:13px 32px;background:linear-gradient(135deg,#00e676,#1de9b6);color:#020810;font-weight:800;border-radius:50px;text-decoration:none;font-size:15px}
+.foot{text-align:center;margin-top:24px;color:rgba(255,255,255,0.2);font-size:12px}
+.foot span{color:#00e676;font-weight:700}</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <div class="brand">🌾 AgroLink</div>
+    <a href="${DOMAIN}" style="color:#00e676;font-size:13px;text-decoration:none">Ana Sayfa →</a>
+  </div>
+  <div class="card">
+    <a href="${profUrl}" style="text-decoration:none">
+      <div class="author">
+        <img class="avatar" src="${profPic}" alt="${post.name}" onerror="this.src='${DOMAIN}/agro.png'">
+        <div><div class="aname">${post.name||post.username}${badge}</div><div class="ausr">@${post.username}</div></div>
+      </div>
+    </a>
+    ${mediaHtml ? `<div class="media-wrap">${mediaHtml}</div>` : ''}
+    ${post.content ? `<div class="body">${(post.content||'').replace(/<[^>]*>/g,'')}</div>` : ''}
+    <div class="stats">
+      <div>❤️ <strong>${post.likeCount||0}</strong></div>
+      <div>💬 <strong>${post.commentCount||0}</strong></div>
+    </div>
+    <div class="time">${timeAgo}</div>
+  </div>
+  <div class="cta-area"><a class="cta" href="${DOMAIN}">📱 AgroLink'te Aç</a></div>
+  <div class="foot">🌾 <span>AgroLink</span> — Tarım Topluluğu</div>
+</div>
+</body></html>`);
+    } catch (e) {
+        console.error('[POST SAYFASI /post/] Hata:', e.message);
+        res.redirect('/');
+    }
+});
+
 // Gönderi paylaşım sayfası: /p/:postId
 app.get('/p/:postId', async (req, res) => {
     const DOMAIN = process.env.APP_URL || 'https://sehitumitkestitarimmtal.com';
@@ -9839,7 +10262,8 @@ app.post('/api/auth/verify-2fa', validateAuthInput, async (req, res) => {
         if (!user) return res.status(401).json({ error: 'Kullanıcı bulunamadı' });
 
         await dbRun('UPDATE users SET "lastLogin" = NOW(), "isOnline" = TRUE, "updatedAt" = NOW() WHERE id = $1', [user.id]);
-
+        dbRun(`INSERT INTO user_login_hours ("userId", hour) VALUES ($1, $2)`,
+            [user.id, new Date().getHours()]).catch(() => {});
         const tokens = generateTokens(user);
         const tokenHash = crypto.createHash('sha256').update(tokens.refreshToken).digest('hex');
         await dbRun(
@@ -9927,7 +10351,7 @@ app.post('/api/auth/not-me', async (req, res) => {
         sendEmail(user.email, '⚠️ Agrolink — Şüpheli Giriş Bildirimi',
             `<p>Hesabınıza şüpheli bir giriş yapıldı ve siz bunu bildirdiniz.</p>
              <p>Tüm oturumlarınız sonlandırıldı. Lütfen şifrenizi değiştirin.</p>
-             <p>Şifre sıfırlama bağlantısı: <a href="https://sehitumitkestitarimmtal.com/api/auth/reset-password-direct?token=${resetToken}">Buraya tıklayın</a></p>`
+             <p>Şifre sıfırlama bağlantısı: <a href="${process.env.APP_URL || "https://sehitumitkestitarimmtal.com"}/api/auth/reset-password-direct?token=${resetToken}">Buraya tıklayın</a></p>`
         ).catch(() => {});
 
         res.json({
@@ -10974,7 +11398,7 @@ app.delete('/api/users/account/delete', authenticateToken, async (req, res) => {
         if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
 
         const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ error: 'Şifre yanlış' });
+        if (!valid) return res.status(401).json({ error: 'E-posta/kullanıcı adı veya şifre hatalı' });
 
         // Soft delete
         await dbRun(
@@ -11089,7 +11513,7 @@ app.delete('/api/users/account', authenticateToken, async (req, res) => {
         const user = await dbGet('SELECT password FROM users WHERE id=$1', [req.user.id]);
         if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
         const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ error: 'Şifre yanlış' });
+        if (!valid) return res.status(401).json({ error: 'E-posta/kullanıcı adı veya şifre hatalı' });
         await dbRun('UPDATE users SET "isActive"=FALSE,"updatedAt"=NOW() WHERE id=$1', [req.user.id]);
         await dbRun('DELETE FROM refresh_tokens WHERE "userId"=$1', [req.user.id]).catch(()=>{});
         res.json({ message: 'Hesap silindi' });
@@ -11436,11 +11860,14 @@ function getErrorPageHtml(title, message) {
 
 // ─── ŞIFRE SIFIRLA DİREKT LİNK: GET /api/auth/reset-password-direct ─
 app.get('/api/auth/reset-password-direct', async (req, res) => {
-    const token = typeof req.query.token === 'string' ? req.query.token : null;
+    const token = typeof req.query.token === 'string' ? req.query.token.trim() : null;
 
     if (!token || !/^[a-f0-9]{64}$/i.test(token)) {
         return res.type('html').send(getErrorPageHtml('Geçersiz Bağlantı', 'Bu link artık geçerli değil.'));
     }
+
+    // 🔒 DB'de token hash'i saklıyoruz — ham token ile değil, sha256 ile ara
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
 
     try {
         // Önce password_resets tablosuna bak (forgot-password akışı)
@@ -11449,7 +11876,7 @@ app.get('/api/auth/reset-password-direct', async (req, res) => {
              JOIN users u ON pr."userId" = u.id
              WHERE pr.token = $1 AND pr.used = FALSE AND pr."expiresAt" > NOW()
              LIMIT 1`,
-            [token]
+            [tokenHash]
         ).catch(() => null);
 
         // Bulunamazsa suspicious_login_reports tablosuna bak (not-me akışı)
@@ -11472,6 +11899,7 @@ app.get('/api/auth/reset-password-direct', async (req, res) => {
 
         console.log(`🔐 Şifre sıfırlama sayfası açıldı: @${record.username}`);
         res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('Referrer-Policy', 'no-referrer');
         res.type('html').send(getPasswordResetPageHtml(record.username, token));
 
     } catch (e) {
@@ -11490,7 +11918,7 @@ app.get('/api/users/:id/profile', authenticateToken, async (req, res) => {
         const user = await dbGet(`
             SELECT u.id, u.username, u.name, u."profilePic", u."coverPic", u.bio, u.location,
                    u.website, u."isVerified", u."hasFarmerBadge", u."userType", u."isOnline",
-                   u."lastSeen", u."createdAt",
+                   u."lastSeen", u."createdAt", u."isPrivate",
                    (SELECT COUNT(*) FROM posts   WHERE "userId"=u.id AND "isActive"=TRUE) AS "postCount",
                    (SELECT COUNT(*) FROM follows WHERE "followingId"=u.id)                AS "followerCount",
                    (SELECT COUNT(*) FROM follows WHERE "followerId"=u.id)                 AS "followingCount",
@@ -11498,9 +11926,30 @@ app.get('/api/users/:id/profile', authenticateToken, async (req, res) => {
                    EXISTS(SELECT 1 FROM blocks  WHERE ("blockerId"=$1 AND "blockedId"=u.id) OR ("blockerId"=u.id AND "blockedId"=$1)) AS "isBlocked"
             FROM users u WHERE u.id=$2 AND u."isActive"=TRUE`, [req.user.id, req.params.id]);
         if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
-        // 🔒 ENGEL KONTROLÜ — çift yönlü (sen engellediysen de, o engellediyse de erişim yok)
+        // 🔒 ENGEL KONTROLÜ
         if (user.isBlocked && user.id !== req.user.id) {
             return res.status(403).json({ error: 'Engelli kullanıcı' });
+        }
+        const isSelf      = user.id === req.user.id;
+        const isFollowing = user.isFollowing;
+        // 🔒 GİZLİ HESAP KONTROLÜ — takipçi değilse sadece temel bilgi git
+        if (user.isPrivate && !isSelf && !isFollowing) {
+            console.log(`[GİZLİ HESAP] userId=${req.user.id} → hedef=${user.id} (${user.username}) — kısıtlı profil`);
+            return res.json({
+                user: {
+                    id          : user.id,
+                    username    : user.username,
+                    name        : user.name,
+                    profilePic  : user.profilePic,
+                    isVerified  : user.isVerified,
+                    hasFarmerBadge: user.hasFarmerBadge,
+                    isPrivate   : true,
+                    isFollowing : false,
+                    postCount   : 0,
+                    followerCount: 0,
+                    followingCount: 0,
+                },
+            });
         }
         const { password: _, ...safe } = user;
         res.json({ user: safe });
@@ -11525,6 +11974,9 @@ app.post('/api/auth/reset-password-with-token', async (req, res) => {
         if (newPassword.length < 8)
             return res.status(400).json({ error: 'Şifre en az 8 karakter olmalıdır' });
 
+        // 🔒 DB'de token hash'i saklanıyor — ham token yerine sha256 ile ara
+        const resetTokenHash = crypto.createHash('sha256').update(resetToken).digest('hex');
+
         const cleanUsername = username.toLowerCase().trim();
         const user = await dbGet(
             `SELECT * FROM users WHERE LOWER(username) = $1 AND "isActive" = TRUE`,
@@ -11536,7 +11988,7 @@ app.post('/api/auth/reset-password-with-token', async (req, res) => {
         let tokenRecord = await dbGet(
             `SELECT id FROM password_resets
              WHERE "userId" = $1 AND token = $2 AND used = FALSE AND "expiresAt" > NOW()`,
-            [user.id, resetToken]
+            [user.id, resetTokenHash]
         ).catch(() => null);
         let tokenSource = 'password_resets';
 
@@ -11620,7 +12072,7 @@ app.post('/api/messages/share-post', authenticateToken, async (req, res) => {
         if (blocked) return res.status(403).json({ error: 'Bu kullanıcıya mesaj gönderemezsiniz' });
 
         const msgId = uuidv4();
-        const postUrl = `/post/${postId}`;
+        const postUrl = `/p/${postId}`;
         await dbRun(
             `INSERT INTO messages (id,"senderId","senderUsername","recipientId","recipientUsername",content,read,"createdAt","updatedAt")
              VALUES ($1,$2,$3,$4,$5,$6,FALSE,NOW(),NOW())`,
@@ -11721,7 +12173,7 @@ app.delete('/api/users/delete', authenticateToken, async (req, res) => {
         if (!password) return res.status(400).json({ error: 'Şifre gerekli' });
         const user = await dbGet('SELECT password FROM users WHERE id=$1', [req.user.id]);
         const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ error: 'Şifre yanlış' });
+        if (!valid) return res.status(401).json({ error: 'E-posta/kullanıcı adı veya şifre hatalı' });
         await dbRun('UPDATE users SET "isActive"=FALSE,"updatedAt"=NOW() WHERE id=$1', [req.user.id]);
         await dbRun('DELETE FROM refresh_tokens WHERE "userId"=$1', [req.user.id]).catch(()=>{});
         res.json({ message: 'Hesap silindi' });
@@ -14258,6 +14710,34 @@ app.post('/api/tarim-fiyatlari/:id/takip', authenticateToken, async (req, res) =
     } catch(e) { console.error('[hasat migration]', e.message); }
 })();
 
+// ── Akıllı Bildirim: gönderim log tablosu ────────────────────────────────────
+(async () => {
+    try {
+        await dbRun(`
+            CREATE TABLE IF NOT EXISTS notification_send_log (
+                id          SERIAL PRIMARY KEY,
+                "userId"    INTEGER NOT NULL,
+                campaign    VARCHAR(30) NOT NULL,
+                "sentAt"    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                date        DATE NOT NULL DEFAULT CURRENT_DATE,
+                UNIQUE ("userId", campaign, date)
+            )
+        `);
+        await dbRun(`CREATE INDEX IF NOT EXISTS idx_notif_log_date ON notification_send_log("userId", date)`);
+        // Kullanıcı giriş saatlerini takip eden tablo
+        await dbRun(`
+            CREATE TABLE IF NOT EXISTS user_login_hours (
+                id          SERIAL PRIMARY KEY,
+                "userId"    INTEGER NOT NULL,
+                hour        SMALLINT NOT NULL,
+                "loggedAt"  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        `);
+        await dbRun(`CREATE INDEX IF NOT EXISTS idx_login_hours_user ON user_login_hours("userId", "loggedAt" DESC)`);
+        console.log('✅ Akıllı Bildirim tabloları hazır');
+    } catch(e) { console.error('[smart-notif migration]', e.message); }
+})();
+
 // GET /api/hasat-takip/tarlalar
 app.get('/api/hasat-takip/tarlalar', authenticateToken, async (req, res) => {
     try {
@@ -14395,1066 +14875,342 @@ a{display:block;padding:16px;background:#10b981;color:white;border-radius:16px;f
 });
 
 
-// GET  /chatsee           → public/chatsee/index.html
-// GET  /api/chatsee/*     → ChatSee REST API
-// =============================================================================
 
-// ══════════════════════════════════════════════════════════════════════
-// 💬 CHATSEE AUTH — AgroLink sistemiyle köprü
-// ChatSee kendi auth sistemi KULLANMAZ.
-// Mevcut AgroLink kullanıcıları buradan giriş yapar.
-// Yeni kullanıcılar da buradan kayıt olabilir.
-// ══════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════════════
+// 🤝 PARTNERLİK & İŞ BAŞVURUSU ENDPOINTLERİ
+// ════════════════════════════════════════════════════════════════════════════
 
-// POST /api/chatsee/auth/login
-// Body: { identifier, password } veya { email, password } veya { username, password }
-app.post('/api/chatsee/auth/login', async (req, res) => {
+// POST /api/partnership/apply — Auth gerektirmez, herkese açık
+app.post('/api/partnership/apply', async (req, res) => {
     try {
-        const { identifier, email, username, password } = req.body;
-        const loginId = (identifier || email || username || '').toLowerCase().trim();
+        const { fullName, email, phone, workField, message } = req.body;
 
-        if (!loginId || !password)
-            return res.status(400).json({ error: 'E-posta/kullanıcı adı ve şifre gerekli' });
+        if (!fullName || !email || !workField) {
+            return res.status(400).json({ success: false, message: 'Ad soyad, e-posta ve çalışma alanı zorunludur.' });
+        }
 
-        const user = await dbGet(
-            `SELECT id, username, name, email, password, role, plan,
-                    "profilePic", "isVerified", "isActive", "isBanned",
-                    "twoFactorEnabled", "hasFarmerBadge"
-             FROM users WHERE (email = $1 OR username = $1) AND "isActive" = TRUE`,
-            [loginId]
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+            return res.status(400).json({ success: false, message: 'Geçersiz e-posta adresi.' });
+        }
+
+        const existing = await dbGet(
+            `SELECT id FROM partnership_applications WHERE email = $1 AND status = 'pending'`,
+            [email.toLowerCase().trim()]
         );
+        if (existing) {
+            return res.status(409).json({ success: false, message: 'Bu e-posta ile zaten bekleyen bir başvurunuz var.' });
+        }
 
-        if (!user) return res.status(401).json({ error: 'Kullanıcı adı/e-posta veya şifre hatalı' });
-        if (user.isBanned) return res.status(403).json({ error: 'Bu hesap askıya alınmış' });
-
-        const valid = await bcrypt.compare(password, user.password);
-        if (!valid) return res.status(401).json({ error: 'Kullanıcı adı/e-posta veya şifre hatalı' });
-
-        // Online güncelle
+        const appId = uuidv4();
         await dbRun(
-            `UPDATE users SET "isOnline"=TRUE, "lastLogin"=NOW(), "updatedAt"=NOW() WHERE id=$1`,
-            [user.id]
+            `INSERT INTO partnership_applications (id, "fullName", email, phone, "workField", message, status, "createdAt", "updatedAt")
+             VALUES ($1, $2, $3, $4, $5, $6, 'pending', NOW(), NOW())`,
+            [appId, fullName.trim(), email.toLowerCase().trim(), phone?.trim() || null, workField.trim(), message?.trim() || null]
         );
 
-        const tokens = generateTokens(user);
+        // ─── Admin bildirim maili ────────────────────────────────────────────
+        const BASE_URL = (process.env.APP_URL || 'https://www.sehitumitkestitarimmtal.com').replace(/\/$/, '');
+        const approveUrl = `${BASE_URL}/api/partnership/action/${appId}/approve`;
+        const rejectUrl  = `${BASE_URL}/api/partnership/action/${appId}/reject`;
 
-        // 🔒 HttpOnly cookie set et (web tarayıcısı için)
-        setAuthCookies(res, req, tokens);
+        const adminHtml = `<!DOCTYPE html>
+<html lang="tr">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#0f1724;font-family:'Segoe UI',Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#0f1724;padding:40px 16px">
+  <tr><td align="center">
+    <table width="600" cellpadding="0" cellspacing="0" style="background:#141e30;border-radius:20px;overflow:hidden;border:1px solid rgba(34,197,94,0.2)">
+      <!-- Header -->
+      <tr><td style="background:linear-gradient(135deg,#0d3321,#0a4a1e);padding:32px 40px;text-align:center">
+        <div style="display:inline-flex;align-items:center;gap:10px">
+          <span style="font-size:28px">🤝</span>
+          <span style="color:#22c55e;font-size:22px;font-weight:700;letter-spacing:-0.5px">Agro Sosyal</span>
+        </div>
+        <h1 style="margin:12px 0 0;color:#fff;font-size:20px;font-weight:600">Yeni Partnerlik Başvurusu</h1>
+      </td></tr>
+      <!-- Body -->
+      <tr><td style="padding:36px 40px">
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-radius:12px;overflow:hidden;border:1px solid rgba(255,255,255,0.07)">
+          <tr style="background:rgba(255,255,255,0.04)">
+            <td style="padding:12px 16px;color:#64748b;font-size:13px;width:140px">Ad Soyad</td>
+            <td style="padding:12px 16px;color:#f1f5f9;font-weight:600;font-size:14px">${fullName}</td>
+          </tr>
+          <tr>
+            <td style="padding:12px 16px;color:#64748b;font-size:13px">E-posta</td>
+            <td style="padding:12px 16px;color:#f1f5f9;font-size:14px">${email}</td>
+          </tr>
+          <tr style="background:rgba(255,255,255,0.04)">
+            <td style="padding:12px 16px;color:#64748b;font-size:13px">Telefon</td>
+            <td style="padding:12px 16px;color:#f1f5f9;font-size:14px">${phone || '—'}</td>
+          </tr>
+          <tr>
+            <td style="padding:12px 16px;color:#64748b;font-size:13px">Çalışma Alanı</td>
+            <td style="padding:12px 16px;color:#22c55e;font-weight:700;font-size:14px">${workField}</td>
+          </tr>
+          <tr style="background:rgba(255,255,255,0.04)">
+            <td style="padding:12px 16px;color:#64748b;font-size:13px;vertical-align:top">Mesaj</td>
+            <td style="padding:12px 16px;color:#f1f5f9;font-size:14px;line-height:1.6">${message || '—'}</td>
+          </tr>
+          <tr>
+            <td style="padding:12px 16px;color:#64748b;font-size:13px">Başvuru ID</td>
+            <td style="padding:12px 16px;color:#475569;font-size:11px;font-family:monospace">${appId}</td>
+          </tr>
+        </table>
 
-        res.json({
-            success     : true,
-            token       : tokens.accessToken,
-            refreshToken: tokens.refreshToken,
-            user: {
-                id        : user.id,
-                name      : user.name,
-                username  : user.username,
-                profilePic: user.profilePic ? absoluteUrl(user.profilePic)
-                            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(user.username)}&backgroundColor=0a1628`,
-                isVerified: user.isVerified,
-                hasFarmerBadge: user.hasFarmerBadge,
-                role      : user.role,
-            },
-        });
-    } catch (e) {
-        console.error('[ChatSee] /auth/login:', e.message);
+        <!-- Action Buttons -->
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:28px">
+          <tr>
+            <td align="center" style="padding:0 8px">
+              <a href="${approveUrl}" style="display:inline-block;background:linear-gradient(135deg,#16a34a,#22c55e);color:#fff;text-decoration:none;padding:14px 40px;border-radius:12px;font-size:15px;font-weight:700;letter-spacing:0.3px">
+                ✅ Onayla
+              </a>
+            </td>
+            <td align="center" style="padding:0 8px">
+              <a href="${rejectUrl}" style="display:inline-block;background:linear-gradient(135deg,#991b1b,#ef4444);color:#fff;text-decoration:none;padding:14px 40px;border-radius:12px;font-size:15px;font-weight:700;letter-spacing:0.3px">
+                ❌ Reddet
+              </a>
+            </td>
+          </tr>
+        </table>
+
+        <p style="margin:24px 0 0;text-align:center;color:#475569;font-size:12px">
+          Butonlara tıklamak başvuruyu doğrudan günceller ve adaya bildirim maili gönderir.
+        </p>
+      </td></tr>
+      <!-- Footer -->
+      <tr><td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.07);text-align:center">
+        <p style="margin:0;color:#334155;font-size:12px">Agro Sosyal — Admin Paneli · Fatsa / Ordu</p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>`;
+
+        await sendEmail('noreply.agrolink@gmail.com', `🤝 Yeni Başvuru: ${fullName} — ${workField}`, adminHtml).catch(() => {});
+
+        // ─── Başvurana otomatik teşekkür maili ──────────────────────────────
+        const userThankHtml = `<!DOCTYPE html>
+<html lang="tr">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#0f1724;font-family:'Segoe UI',Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#0f1724;padding:40px 16px">
+  <tr><td align="center">
+    <table width="600" cellpadding="0" cellspacing="0" style="background:#141e30;border-radius:20px;overflow:hidden;border:1px solid rgba(34,197,94,0.2)">
+      <tr><td style="background:linear-gradient(135deg,#0d3321,#0a4a1e);padding:32px 40px;text-align:center">
+        <span style="font-size:48px">✅</span>
+        <h1 style="margin:12px 0 0;color:#22c55e;font-size:22px;font-weight:700">Başvurunuz Alındı!</h1>
+      </td></tr>
+      <tr><td style="padding:36px 40px;color:#cbd5e1;font-size:15px;line-height:1.7">
+        <p>Merhaba <strong style="color:#f1f5f9">${fullName}</strong>,</p>
+        <p>Agro Sosyal bünyesinde <strong style="color:#22c55e">${workField}</strong> alanında çalışma başvurunuz başarıyla alındı.</p>
+        <p>Ekibimiz başvurunuzu inceleyecek ve <strong style="color:#f1f5f9">en kısa sürede</strong> geri dönüş yapacaktır.</p>
+        <div style="margin:24px 0;padding:16px 20px;background:rgba(34,197,94,0.08);border-left:3px solid #22c55e;border-radius:8px">
+          <p style="margin:0;color:#86efac;font-size:13px">Başvuru ID: <code style="color:#4ade80">${appId}</code></p>
+        </div>
+      </td></tr>
+      <tr><td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.07);text-align:center">
+        <p style="margin:0;color:#334155;font-size:12px">Agro Sosyal · Fatsa / Ordu</p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>`;
+
+        await sendEmail(email, '✅ Agro Sosyal — Başvurunuz Alındı', userThankHtml).catch(() => {});
+
+        res.status(201).json({ success: true, message: 'Başvurunuz alındı. En kısa sürede size dönüş yapılacaktır.', id: appId });
+
+    } catch (error) {
+        console.error('Partnership başvuru hatası:', error);
+        res.status(500).json({ success: false, message: 'Sunucu hatası' });
+    }
+});
+
+// GET /api/partnership/action/:id/:action — Maildeki onayla/reddet linki (token korumalı)
+// Bu endpoint sadece doğrudan tarayıcıdan açılır — güvenlik için secret token kontrol eder
+app.get('/api/partnership/action/:id/:action', async (req, res) => {
+    try {
+        const { id, action } = req.params;
+        if (!['approve', 'reject'].includes(action)) {
+            return res.status(400).send('<h2>Geçersiz işlem.</h2>');
+        }
+
+        const application = await dbGet(`SELECT * FROM partnership_applications WHERE id = $1`, [id]);
+        if (!application) {
+            return res.status(404).send(`<!DOCTYPE html><html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#0f1724;color:#f1f5f9"><h2>❌ Başvuru bulunamadı.</h2></body></html>`);
+        }
+        if (application.status !== 'pending') {
+            return res.send(`<!DOCTYPE html>
+<html lang="tr"><head><meta charset="UTF-8"><title>Zaten İşlendi</title></head>
+<body style="margin:0;background:#0f1724;font-family:'Segoe UI',Arial,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh">
+<div style="background:#141e30;border-radius:20px;padding:48px;text-align:center;max-width:480px;border:1px solid rgba(255,255,255,0.1)">
+  <div style="font-size:48px;margin-bottom:16px">⚠️</div>
+  <h2 style="color:#f1f5f9;margin:0 0 12px">Zaten İşlendi</h2>
+  <p style="color:#64748b;margin:0">Bu başvuru daha önce <strong style="color:#fbbf24">${application.status === 'approved' ? 'onaylandı' : 'reddedildi'}</strong>.</p>
+</div>
+</body></html>`);
+        }
+
+        const newStatus = action === 'approve' ? 'approved' : 'rejected';
+        await dbRun(
+            `UPDATE partnership_applications SET status = $1, "reviewedAt" = NOW(), "updatedAt" = NOW() WHERE id = $2`,
+            [newStatus, id]
+        );
+
+        const isApproved = newStatus === 'approved';
+
+        // ─── Başvurana sonuç maili ───────────────────────────────────────────
+        const resultHtml = `<!DOCTYPE html>
+<html lang="tr">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#0f1724;font-family:'Segoe UI',Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#0f1724;padding:40px 16px">
+  <tr><td align="center">
+    <table width="600" cellpadding="0" cellspacing="0" style="background:#141e30;border-radius:20px;overflow:hidden;border:1px solid ${isApproved ? 'rgba(34,197,94,0.25)' : 'rgba(239,68,68,0.25)'}">
+      <tr><td style="background:${isApproved ? 'linear-gradient(135deg,#0d3321,#0a4a1e)' : 'linear-gradient(135deg,#2d0a0a,#450f0f)'};padding:32px 40px;text-align:center">
+        <span style="font-size:48px">${isApproved ? '🎉' : '😔'}</span>
+        <h1 style="margin:12px 0 0;color:${isApproved ? '#22c55e' : '#ef4444'};font-size:22px;font-weight:700">
+          ${isApproved ? 'Başvurunuz Onaylandı!' : 'Başvurunuz Değerlendirildi'}
+        </h1>
+      </td></tr>
+      <tr><td style="padding:36px 40px;color:#cbd5e1;font-size:15px;line-height:1.7">
+        <p>Merhaba <strong style="color:#f1f5f9">${application.fullName}</strong>,</p>
+        ${isApproved
+          ? `<p>Agro Sosyal bünyesinde <strong style="color:#22c55e">${application.workField}</strong> alanındaki başvurunuz <strong style="color:#4ade80">onaylandı!</strong></p>
+             <p>Ekibimiz detaylar için en kısa sürede sizinle iletişime geçecektir.</p>`
+          : `<p><strong style="color:#fca5a5">${application.workField}</strong> alanındaki başvurunuz bu süreçte uygun görülmemiştir.</p>
+             <p style="color:#94a3b8">İlerleyen dönemlerde tekrar başvurabilirsiniz. Gösterdiğiniz ilgi için teşekkür ederiz.</p>`
+        }
+      </td></tr>
+      <tr><td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.07);text-align:center">
+        <p style="margin:0;color:#334155;font-size:12px">Agro Sosyal · Fatsa / Ordu</p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>`;
+
+        await sendEmail(
+            application.email,
+            isApproved ? '🎉 Agro Sosyal — Başvurunuz Onaylandı!' : '❌ Agro Sosyal — Başvuru Sonucu',
+            resultHtml
+        ).catch(() => {});
+
+        // ─── Admin'e görünen onay sayfası (HTML yanıt) ───────────────────────
+        res.send(`<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>${isApproved ? 'Onaylandı' : 'Reddedildi'} — Agro Sosyal</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0f1724; font-family: 'Segoe UI', Arial, sans-serif; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
+    .card { background: #141e30; border-radius: 24px; padding: 48px 40px; text-align: center; max-width: 500px; width: 100%; border: 1px solid ${isApproved ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}; box-shadow: 0 25px 60px rgba(0,0,0,0.5); }
+    .icon { font-size: 64px; margin-bottom: 20px; display: block; }
+    h1 { color: ${isApproved ? '#22c55e' : '#ef4444'}; font-size: 26px; margin-bottom: 12px; }
+    .info { background: rgba(255,255,255,0.04); border-radius: 12px; padding: 20px; margin: 24px 0; text-align: left; border: 1px solid rgba(255,255,255,0.07); }
+    .info-row { display: flex; gap: 8px; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.05); font-size: 14px; }
+    .info-row:last-child { border-bottom: none; }
+    .label { color: #64748b; min-width: 110px; }
+    .value { color: #f1f5f9; font-weight: 500; }
+    .badge { display: inline-block; padding: 6px 16px; border-radius: 9999px; font-size: 13px; font-weight: 700; background: ${isApproved ? 'rgba(34,197,94,0.15)' : 'rgba(239,68,68,0.15)'}; color: ${isApproved ? '#4ade80' : '#fca5a5'}; border: 1px solid ${isApproved ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}; margin-bottom: 16px; }
+    p { color: #64748b; font-size: 14px; line-height: 1.6; }
+    .mail-note { margin-top: 20px; padding: 12px 16px; background: rgba(59,130,246,0.08); border-radius: 8px; border: 1px solid rgba(59,130,246,0.2); color: #93c5fd; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <span class="icon">${isApproved ? '✅' : '❌'}</span>
+    <div class="badge">${isApproved ? 'ONAYLANDI' : 'REDDEDİLDİ'}</div>
+    <h1>${isApproved ? 'Başvuru Onaylandı' : 'Başvuru Reddedildi'}</h1>
+    <div class="info">
+      <div class="info-row"><span class="label">Ad Soyad</span><span class="value">${application.fullName}</span></div>
+      <div class="info-row"><span class="label">E-posta</span><span class="value">${application.email}</span></div>
+      <div class="info-row"><span class="label">Alan</span><span class="value" style="color:${isApproved ? '#4ade80' : '#fca5a5'}">${application.workField}</span></div>
+      <div class="info-row"><span class="label">Başvuru ID</span><span class="value" style="font-family:monospace;font-size:11px;color:#475569">${id}</span></div>
+    </div>
+    <div class="mail-note">📧 Bildirim maili <strong>${application.email}</strong> adresine gönderildi.</div>
+    <p style="margin-top:20px">Bu sayfayı kapatabilirsiniz.</p>
+  </div>
+</body>
+</html>`);
+
+    } catch (error) {
+        console.error('Partnership action hatası:', error);
+        res.status(500).send('<h2>Sunucu hatası</h2>');
+    }
+});
+
+// GET /api/partnership/applications — Admin: tüm başvuruları listele
+app.get('/api/partnership/applications', authenticateToken, requireNotBanned, async (req, res) => {
+    try {
+        if (req.user.role !== 'admin') return res.status(403).json({ error: 'Yetkisiz' });
+        const { status } = req.query;
+        let query = `SELECT * FROM partnership_applications`;
+        const params = [];
+        if (status) { query += ` WHERE status = $1`; params.push(status); }
+        query += ` ORDER BY "createdAt" DESC`;
+        const applications = await dbAll(query, params);
+        res.json({ applications });
+    } catch (error) {
+        console.error('Partnership listeleme hatası:', error);
         res.status(500).json({ error: 'Sunucu hatası' });
     }
 });
 
-// POST /api/chatsee/auth/register
-// Body: { name, username, email, password }
-// display_name → name olarak da kabul edilir
-app.post('/api/chatsee/auth/register', async (req, res) => {
+// POST /api/partnership/review/:id — Admin API ile onayla/reddet
+app.post('/api/partnership/review/:id', authenticateToken, requireNotBanned, async (req, res) => {
     try {
-        const {
-            name, display_name, username, email, password
-        } = req.body;
-
-        const finalName = (name || display_name || '').trim();
-        const cleanUsername = (username || '').toLowerCase().replace(/[^a-z0-9._-]/g, '').trim();
-        const cleanEmail    = (email    || '').toLowerCase().trim();
-        const pwd           = (password || '').trim();
-
-        // Zorunlu alan kontrolü — anlaşılır hata mesajıyla
-        const missing = [];
-        if (!finalName)    missing.push('Ad');
-        if (!cleanUsername) missing.push('Kullanıcı adı');
-        if (!cleanEmail)    missing.push('E-posta');
-        if (!pwd)           missing.push('Şifre');
-
-        if (missing.length)
-            return res.status(400).json({ error: `Şu alanlar zorunlu: ${missing.join(', ')}` });
-
-        if (pwd.length < 8)
-            return res.status(400).json({ error: 'Şifre en az 8 karakter olmalı' });
-
-        if (cleanUsername.length < 3)
-            return res.status(400).json({ error: 'Kullanıcı adı en az 3 karakter olmalı' });
-
-        // Kullanıcı adı/e-posta çakışma kontrolü
-        const existingUser = await dbGet(
-            `SELECT id FROM users WHERE username=$1`,
-            [cleanUsername]
-        );
-        if (existingUser) return res.status(409).json({ error: 'Bu kullanıcı adı zaten alınmış' });
-
-        const existingEmail = await dbGet(
-            `SELECT id FROM users WHERE email=$1`,
-            [cleanEmail]
-        );
-        if (existingEmail) return res.status(409).json({ error: 'Bu e-posta adresi zaten kayıtlı' });
-
-        const hash   = await bcrypt.hash(pwd, BCRYPT_ROUNDS);
-        const userId = uuidv4();
-        const defaultAvatar = `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(cleanUsername)}&backgroundColor=0a1628`;
+        if (req.user.role !== 'admin') return res.status(403).json({ error: 'Yetkisiz' });
+        const { id } = req.params;
+        const { status, reviewNote } = req.body;
+        if (!['approved', 'rejected'].includes(status)) {
+            return res.status(400).json({ error: 'Geçersiz durum.' });
+        }
+        const application = await dbGet(`SELECT * FROM partnership_applications WHERE id = $1`, [id]);
+        if (!application) return res.status(404).json({ error: 'Başvuru bulunamadı' });
 
         await dbRun(
-            `INSERT INTO users
-             (id, name, username, email, password, "profilePic", "userType",
-              "registrationIp", "isOnline", "emailVerified", "createdAt", "updatedAt")
-             VALUES ($1,$2,$3,$4,$5,$6,'normal_kullanici',$7,FALSE,FALSE,NOW(),NOW())`,
-            [userId, finalName, cleanUsername, cleanEmail, hash, null, req.ip]
+            `UPDATE partnership_applications SET status = $1, "reviewNote" = $2, "reviewedAt" = NOW(), "updatedAt" = NOW() WHERE id = $3`,
+            [status, reviewNote?.trim() || null, id]
         );
 
-        const user   = { id: userId, name: finalName, username: cleanUsername,
-                         email: cleanEmail, role: 'user', plan: 'free' };
-        const tokens = generateTokens(user);
-
-        setAuthCookies(res, req, tokens);
-
-        res.status(201).json({
-            success     : true,
-            token       : tokens.accessToken,
-            refreshToken: tokens.refreshToken,
-            user: {
-                id        : userId,
-                name      : finalName,
-                username  : cleanUsername,
-                profilePic: defaultAvatar,
-                isVerified: false,
-                role      : 'user',
-            },
-        });
-    } catch (e) {
-        console.error('[ChatSee] /auth/register:', e.message);
-        if (e.code === '23505') return res.status(409).json({ error: 'Bu kullanıcı adı veya e-posta zaten kayıtlı' });
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// GET /api/chatsee/auth/me — Token doğrula, kullanıcı bilgisi döndür
-app.get('/api/chatsee/auth/me', authenticateToken, async (req, res) => {
-    try {
-        const user = await dbGet(
-            `SELECT id, name, username, "profilePic", "isOnline", "isVerified", "hasFarmerBadge", role
-             FROM users WHERE id=$1 AND "isActive"=TRUE`,
-            [req.user.id]
-        );
-        if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
-        res.json({
-            success: true,
-            user: {
-                ...user,
-                profilePic: user.profilePic ? absoluteUrl(user.profilePic)
-                            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(user.username)}&backgroundColor=0a1628`,
-            },
-        });
-    } catch (e) {
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// POST /api/chatsee/auth/logout
-app.post('/api/chatsee/auth/logout', authenticateToken, async (req, res) => {
-    try {
-        await dbRun(
-            `UPDATE users SET "isOnline"=FALSE, "lastSeen"=NOW() WHERE id=$1`,
-            [req.user.id]
-        );
-        res.clearCookie('access_token');
-        res.clearCookie('refresh_token');
-        res.json({ success: true });
-    } catch (e) {
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ══════════════════════════════════════════════════════════════════════════
-// 🚀 EVRENSEL SUB-APP YÖNLENDİRİCİ
-// public/ içindeki HER klasör otomatik olarak bir SPA sub-app olarak servis edilir.
-// Yeni uygulama eklemek için sadece public/<appname>/ klasörünü ve index.html'i koy.
-//
-// Örnekler:
-//   public/agropay/   → /agropay  ve /agropay/* → public/agropay/index.html
-//   public/chatsee/   → /chatsee  ve /chatsee/* → public/chatsee/index.html
-//   public/agrolink/  → /agrolink ve /agrolink/* → public/agrolink/index.html
-//
-// Hariç tutulan özel klasörler (ayrı route'ları var):
-// ══════════════════════════════════════════════════════════════════════════
-const SUB_APP_EXCLUDE = new Set(['agrolink', 'agro-hava', 'chatsee']); // Zaten özel route'ları var
-
-function registerSubApps() {
-    const publicDir2 = path.join(__dirname, 'public');
-    if (!fssync.existsSync(publicDir2)) return;
-
-    let entries;
-    try { entries = fssync.readdirSync(publicDir2, { withFileTypes: true }); }
-    catch { return; }
-
-    const subApps = entries
-        .filter(e => e.isDirectory() && !SUB_APP_EXCLUDE.has(e.name))
-        .map(e => e.name);
-
-    for (const appName of subApps) {
-        const appDir   = path.join(publicDir2, appName);
-        const htmlPath = path.join(appDir, 'index.html');
-
-        // Statik varlıklar (JS, CSS, resimler)
-        app.use(`/${appName}`, express.static(appDir, {
-            maxAge   : '1d',
-            dotfiles : 'deny',
-            index    : false,   // index.html'i biz kontrol ediyoruz
-        }));
-
-        // SPA: /<appname> ve /<appname>/* → index.html
-        const spaHandler = (req, res) => {
-            if (!fssync.existsSync(htmlPath)) {
-                return res.status(404).send(
-                    `<h2>⚠️ ${appName}: public/${appName}/index.html bulunamadı</h2>`
-                );
-            }
-            res.setHeader('Content-Type', 'text/html; charset=utf-8');
-            res.setHeader('Cache-Control', 'no-cache');
-            res.sendFile(htmlPath);
-        };
-
-        app.get(`/${appName}`, spaHandler);
-        app.get(`/${appName}/*`, spaHandler);
-
-        console.log(`✅ Sub-app kayıtlı: /${appName} → public/${appName}/`);
-    }
+        const isApproved = status === 'approved';
+        const resultHtml = `<!DOCTYPE html><html lang="tr"><head><meta charset="UTF-8"></head>
+<body style="margin:0;background:#0f1724;font-family:'Segoe UI',Arial,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#0f1724;padding:40px 16px">
+<tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0" style="background:#141e30;border-radius:20px;overflow:hidden;border:1px solid ${isApproved ? 'rgba(34,197,94,0.25)' : 'rgba(239,68,68,0.25)'}">
+<tr><td style="background:${isApproved ? 'linear-gradient(135deg,#0d3321,#0a4a1e)' : 'linear-gradient(135deg,#2d0a0a,#450f0f)'};padding:32px 40px;text-align:center">
+<span style="font-size:48px">${isApproved ? '🎉' : '😔'}</span>
+<h1 style="margin:12px 0 0;color:${isApproved ? '#22c55e' : '#ef4444'};font-size:22px;font-weight:700">${isApproved ? 'Başvurunuz Onaylandı!' : 'Başvurunuz Değerlendirildi'}</h1>
+</td></tr>
+<tr><td style="padding:36px 40px;color:#cbd5e1;font-size:15px;line-height:1.7">
+<p>Merhaba <strong style="color:#f1f5f9">${application.fullName}</strong>,</p>
+${isApproved
+  ? `<p>Agro Sosyal bünyesinde <strong style="color:#22c55e">${application.workField}</strong> alanındaki başvurunuz <strong style="color:#4ade80">onaylandı!</strong></p><p>En kısa sürede sizinle iletişime geçeceğiz.</p>`
+  : `<p><strong style="color:#fca5a5">${application.workField}</strong> alanındaki başvurunuz bu süreçte uygun görülmemiştir.</p><p style="color:#94a3b8">İlerleyen dönemlerde tekrar başvurabilirsiniz.</p>`
 }
+${reviewNote ? `<div style="margin-top:16px;padding:12px 16px;background:rgba(255,255,255,0.05);border-radius:8px;color:#94a3b8;font-size:13px">Not: ${reviewNote}</div>` : ''}
+</td></tr>
+<tr><td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.07);text-align:center">
+<p style="margin:0;color:#334155;font-size:12px">Agro Sosyal · Fatsa / Ordu</p>
+</td></tr>
+</table></td></tr></table></body></html>`;
 
-registerSubApps();
-
-// ── Statik: /chatsee → public/chatsee/index.html ─────────────────────────
-app.get('/chatsee', (req, res) => {
-    const p = path.join(__dirname, 'public', 'chatsee', 'index.html');
-    if (fssync.existsSync(p)) {
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        res.sendFile(p);
-    } else {
-        res.status(404).send('ChatSee: public/chatsee/index.html bulunamadı');
-    }
-});
-app.get('/chatsee/*', (req, res) => {
-    const p = path.join(__dirname, 'public', 'chatsee', 'index.html');
-    if (fssync.existsSync(p)) {
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        res.sendFile(p);
-    } else {
-        res.status(404).send('ChatSee: public/chatsee/index.html bulunamadı');
-    }
-});
-
-// ── Helper: cookie VEYA Bearer token'dan JWT döndür ──────────────────────
-function csToken(req) {
-    const cookie = req.cookies?.access_token;
-    if (cookie) return cookie;
-    const h = req.headers['authorization'] || '';
-    return h.startsWith('Bearer ') ? h.slice(7) : null;
-}
-
-// ── GET /api/chatsee/token — Socket.IO için access_token'ı döndür ────────
-// Frontend HttpOnly cookie'yi okuyamadığı için bu endpoint üzerinden alır
-app.get('/api/chatsee/token', authenticateToken, (req, res) => {
-    const tokens = generateTokens(req.user);
-    res.json({ token: tokens.accessToken });
-});
-
-// ── GET /api/chatsee/me ───────────────────────────────────────────────────
-app.get('/api/chatsee/me', authenticateToken, async (req, res) => {
-    try {
-        const user = await dbGet(
-            `SELECT id, name, username, "profilePic", "isOnline", "lastSeen"
-             FROM users WHERE id = $1 AND "isActive" = TRUE`,
-            [req.user.id]
-        );
-        if (!user) return res.status(404).json({ error: 'Kullanıcı bulunamadı' });
-        res.json({
-            id        : user.id,
-            name      : user.name,
-            username  : user.username,
-            profilePic: user.profilePic ? absoluteUrl(user.profilePic)
-                        : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(user.username)}&backgroundColor=0a1628`,
-            isOnline  : user.isOnline,
-        });
-    } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// ── GET /api/chatsee/conversations — Kullanıcının konuşma listesi ─────────
-app.get('/api/chatsee/conversations', authenticateToken, async (req, res) => {
-    try {
-        const uid = req.user.id;
-        const rows = await pool.query(`
-            SELECT
-                c.id,
-                c.type,
-                c.name            AS group_name,
-                c.avatar_url,
-                c."updatedAt",
-                -- Son mesaj
-                lm.id             AS last_msg_id,
-                lm.content        AS last_message,
-                lm."createdAt"    AS last_message_at,
-                lm.sender_id      AS last_sender_id,
-                lu.name           AS last_sender_name,
-                -- Okunmamış sayı
-                (
-                    SELECT COUNT(*)::int FROM chatsee_messages m2
-                    LEFT JOIN chatsee_reads r2 ON r2.message_id = m2.id AND r2.user_id = $1
-                    WHERE m2.conversation_id = c.id
-                      AND m2.sender_id != $1
-                      AND m2.is_deleted = FALSE
-                      AND r2.message_id IS NULL
-                ) AS unread_count,
-                -- Karşı taraf (direkt konuşma)
-                ou.id             AS other_id,
-                ou.name           AS other_name,
-                ou.username       AS other_username,
-                ou."profilePic"   AS other_pic,
-                ou."isOnline"     AS other_online,
-                ou."lastSeen"     AS other_last_seen
-            FROM chatsee_conversations c
-            JOIN chatsee_members cm ON cm.conversation_id = c.id AND cm.user_id = $1
-            LEFT JOIN LATERAL (
-                SELECT id, content, "createdAt", sender_id
-                FROM chatsee_messages
-                WHERE conversation_id = c.id AND is_deleted = FALSE
-                ORDER BY "createdAt" DESC LIMIT 1
-            ) lm ON TRUE
-            LEFT JOIN users lu ON lu.id = lm.sender_id
-            LEFT JOIN LATERAL (
-                SELECT u.id, u.name, u.username, u."profilePic", u."isOnline", u."lastSeen"
-                FROM chatsee_members cm2
-                JOIN users u ON u.id = cm2.user_id
-                WHERE cm2.conversation_id = c.id AND cm2.user_id != $1
-                LIMIT 1
-            ) ou ON c.type = 'direct'
-            ORDER BY COALESCE(lm."createdAt", c."createdAt") DESC
-        `, [uid]);
-
-        const csAv = (pic, seed) => pic ? absoluteUrl(pic)
-            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(seed||'g')}&backgroundColor=0a1628`;
-
-        res.json(rows.rows.map(r => ({
-            id           : r.id,
-            type         : r.type,
-            name         : r.type === 'direct' ? r.other_name  : r.group_name,
-            username     : r.type === 'direct' ? r.other_username : null,
-            profilePic   : r.type === 'direct' ? csAv(r.other_pic, r.other_username) : csAv(r.avatar_url, r.group_name),
-            isOnline     : r.type === 'direct' ? r.other_online : false,
-            lastSeen     : r.other_last_seen,
-            otherId      : r.other_id,
-            lastMessage  : r.last_message,
-            lastMessageAt: r.last_message_at,
-            lastSenderId : r.last_sender_id,
-            unreadCount  : parseInt(r.unread_count || 0),
-        })));
-    } catch (e) {
-        console.error('[ChatSee] /conversations:', e.message);
+        await sendEmail(application.email, isApproved ? '🎉 Agro Sosyal — Başvurunuz Onaylandı!' : '❌ Agro Sosyal — Başvuru Sonucu', resultHtml).catch(() => {});
+        res.json({ success: true, message: isApproved ? 'Başvuru onaylandı.' : 'Başvuru reddedildi.' });
+    } catch (error) {
+        console.error('Partnership review hatası:', error);
         res.status(500).json({ error: 'Sunucu hatası' });
     }
 });
 
-// ── POST /api/chatsee/conversations/direct — DM başlat / mevcut bul ──────
-app.post('/api/chatsee/conversations/direct', authenticateToken, async (req, res) => {
-    try {
-        const { targetUserId } = req.body;
-        if (!targetUserId) return res.status(400).json({ error: 'targetUserId gerekli' });
-        const myId = req.user.id;
-
-        // Engel kontrolü
-        const blocked = await pool.query(
-            `SELECT 1 FROM blocks WHERE ("blockerId"=$1 AND "blockedId"=$2) OR ("blockerId"=$2 AND "blockedId"=$1)`,
-            [myId, targetUserId]
-        );
-        if (blocked.rows.length) return res.status(403).json({ error: 'Bu kullanıcıyla mesajlaşamazsınız' });
-
-        // Mevcut direkt konuşmayı bul
-        const existing = await pool.query(`
-            SELECT c.id FROM chatsee_conversations c
-            JOIN chatsee_members m1 ON m1.conversation_id = c.id AND m1.user_id = $1
-            JOIN chatsee_members m2 ON m2.conversation_id = c.id AND m2.user_id = $2
-            WHERE c.type = 'direct'
-            LIMIT 1
-        `, [myId, targetUserId]);
-
-        if (existing.rows.length) {
-            return res.json({ conversationId: existing.rows[0].id, created: false });
-        }
-
-        // Yeni konuşma oluştur
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-            const convId = require('uuid').v4();
-            await client.query(
-                `INSERT INTO chatsee_conversations (id, type, created_by) VALUES ($1,'direct',$2)`,
-                [convId, myId]
-            );
-            await client.query(
-                `INSERT INTO chatsee_members (conversation_id, user_id) VALUES ($1,$2),($1,$3)`,
-                [convId, myId, targetUserId]
-            );
-            await client.query('COMMIT');
-            res.status(201).json({ conversationId: convId, created: true });
-        } catch (err) {
-            await client.query('ROLLBACK');
-            throw err;
-        } finally { client.release(); }
-    } catch (e) {
-        console.error('[ChatSee] /direct:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ── POST /api/chatsee/conversations/group — Grup oluştur ─────────────────
-app.post('/api/chatsee/conversations/group', authenticateToken, async (req, res) => {
-    try {
-        const { name, memberIds } = req.body;
-        if (!name || !Array.isArray(memberIds) || memberIds.length < 2)
-            return res.status(400).json({ error: 'Grup adı ve en az 2 üye gerekli' });
-
-        const myId   = req.user.id;
-        const allIds = [...new Set([myId, ...memberIds])];
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-            const convId = require('uuid').v4();
-            await client.query(
-                `INSERT INTO chatsee_conversations (id, type, name, created_by) VALUES ($1,'group',$2,$3)`,
-                [convId, name, myId]
-            );
-            for (const uid of allIds) {
-                await client.query(
-                    `INSERT INTO chatsee_members (conversation_id, user_id, is_admin) VALUES ($1,$2,$3)`,
-                    [convId, uid, uid === myId]
-                );
-            }
-            await client.query('COMMIT');
-            res.status(201).json({ conversationId: convId });
-        } catch (err) {
-            await client.query('ROLLBACK');
-            throw err;
-        } finally { client.release(); }
-    } catch (e) {
-        console.error('[ChatSee] /group:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ── GET /api/chatsee/conversations/:id/messages — Mesajları getir ─────────
-app.get('/api/chatsee/conversations/:id/messages', authenticateToken, async (req, res) => {
-    try {
-        const convId = req.params.id;
-        const myId   = req.user.id;
-        const limit  = Math.min(parseInt(req.query.limit) || 50, 100);
-        const before = req.query.before || null;
-
-        // Üyelik kontrolü
-        const mem = await pool.query(
-            `SELECT 1 FROM chatsee_members WHERE conversation_id=$1 AND user_id=$2`,
-            [convId, myId]
-        );
-        if (!mem.rows.length) return res.status(403).json({ error: 'Erişim izniniz yok' });
-
-        const params = [convId, limit];
-        let cursor = '';
-        if (before) { cursor = 'AND m."createdAt" < $3'; params.push(before); }
-
-        const msgs = await pool.query(`
-            SELECT
-                m.id,
-                m.conversation_id,
-                m.sender_id,
-                m.content,
-                m.type,
-                m.reply_to_id,
-                m.is_deleted,
-                m."createdAt",
-                u.name          AS sender_name,
-                u.username      AS sender_username,
-                u."profilePic"  AS sender_pic,
-                u."isVerified"  AS sender_verified,
-                (
-                    SELECT JSON_AGG(r.user_id)
-                    FROM chatsee_reads r WHERE r.message_id = m.id
-                ) AS read_by
-            FROM chatsee_messages m
-            JOIN users u ON u.id = m.sender_id
-            WHERE m.conversation_id = $1 ${cursor}
-            ORDER BY m."createdAt" DESC
-            LIMIT $2
-        `, params);
-
-        // Okundu işaretle (arka planda)
-        const unreadIds = msgs.rows
-            .filter(r => r.sender_id !== myId)
-            .map(r => r.id);
-        if (unreadIds.length) {
-            pool.query(
-                `INSERT INTO chatsee_reads (message_id, user_id, "readAt")
-                 SELECT unnest($1::uuid[]), $2, NOW()
-                 ON CONFLICT DO NOTHING`,
-                [unreadIds, myId]
-            ).catch(() => {});
-            pool.query(
-                `UPDATE chatsee_members SET last_read_at=NOW() WHERE conversation_id=$1 AND user_id=$2`,
-                [convId, myId]
-            ).catch(() => {});
-        }
-
-        const csAv = (pic, seed) => pic ? absoluteUrl(pic)
-            : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(seed||'u')}&backgroundColor=0a1628`;
-
-        res.json(msgs.rows.reverse().map(r => ({
-            id            : r.id,
-            conversationId: r.conversation_id,
-            senderId      : r.sender_id,
-            content       : r.content,
-            type          : r.type,
-            replyToId     : r.reply_to_id,
-            isDeleted     : r.is_deleted,
-            createdAt     : r.createdAt,
-            readBy        : r.read_by || [],
-            sender: {
-                id        : r.sender_id,
-                name      : r.sender_name,
-                username  : r.sender_username,
-                profilePic: csAv(r.sender_pic, r.sender_username),
-                isVerified: r.sender_verified,
-            },
-        })));
-    } catch (e) {
-        console.error('[ChatSee] /messages:', e.message);
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// ── DELETE /api/chatsee/messages/:id — Mesaj sil ─────────────────────────
-app.delete('/api/chatsee/messages/:id', authenticateToken, async (req, res) => {
-    try {
-        const { rows } = await pool.query(
-            `UPDATE chatsee_messages
-             SET is_deleted=TRUE, content='Bu mesaj silindi.', type='deleted'
-             WHERE id=$1 AND sender_id=$2
-             RETURNING id, conversation_id`,
-            [req.params.id, req.user.id]
-        );
-        if (!rows.length) return res.status(403).json({ error: 'İzin yok veya mesaj bulunamadı' });
-        // Socket bildir
-        if (io) io.to(`cs:${rows[0].conversation_id}`)
-            .emit('chatsee:deleted', { messageId: rows[0].id, conversationId: rows[0].conversation_id });
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// ── GET /api/chatsee/users/search?q= — Kullanıcı ara ─────────────────────
-app.get('/api/chatsee/users/search', authenticateToken, async (req, res) => {
-    const q = (req.query.q || '').trim().toLowerCase();
-    if (q.length < 2) return res.json([]);
-    try {
-        const { rows } = await pool.query(`
-            SELECT u.id, u.name, u.username, u."profilePic", u."isOnline", u."lastSeen",
-                   u."isVerified", u."hasFarmerBadge"
-            FROM users u
-            WHERE (LOWER(u.username) LIKE $1 OR LOWER(u.name) LIKE $1)
-              AND u.id != $2
-              AND u."isActive" = TRUE
-              AND u."isBanned" = FALSE
-              AND NOT EXISTS (
-                  SELECT 1 FROM blocks b
-                  WHERE (b."blockerId"=$2 AND b."blockedId"=u.id)
-                     OR (b."blockerId"=u.id AND b."blockedId"=$2)
-              )
-            ORDER BY u."isOnline" DESC, u.username
-            LIMIT 20
-        `, [`%${q}%`, req.user.id]);
-
-        res.json(rows.map(r => ({
-            ...r,
-            profilePic: r.profilePic ? absoluteUrl(r.profilePic)
-                : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(r.username)}&backgroundColor=0a1628`,
-        })));
-    } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// ── GET /api/chatsee/conversations/:id/members — Grup üyeleri ────────────
-app.get('/api/chatsee/conversations/:id/members', authenticateToken, async (req, res) => {
-    try {
-        const mem = await pool.query(
-            `SELECT 1 FROM chatsee_members WHERE conversation_id=$1 AND user_id=$2`,
-            [req.params.id, req.user.id]
-        );
-        if (!mem.rows.length) return res.status(403).json({ error: 'Erişim yok' });
-
-        const { rows } = await pool.query(`
-            SELECT u.id, u.name, u.username, u."profilePic", u."isOnline", u."lastSeen",
-                   m.is_admin, m."joinedAt"
-            FROM chatsee_members m
-            JOIN users u ON u.id = m.user_id
-            WHERE m.conversation_id = $1
-            ORDER BY m.is_admin DESC, u.name
-        `, [req.params.id]);
-
-        res.json(rows.map(r => ({
-            ...r,
-            profilePic: r.profilePic ? absoluteUrl(r.profilePic)
-                : `https://api.dicebear.com/7.x/thumbs/svg?seed=${encodeURIComponent(r.username)}&backgroundColor=0a1628`,
-        })));
-    } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// =============================================================================
-// END CHATSEE ROTALAR
-// =============================================================================
-
-// =============================================================================
-// 📡 /api/channels ALIAS ROTALAR — Frontend channels API'yi kullanıyor
-//    Bunlar chatsee altyapısını kullanır (aynı DB tabloları)
-// =============================================================================
-
-// POST /api/channels — Kanal oluştur
-app.post('/api/channels', authenticateToken, async (req, res) => {
-    try {
-        const { name, memberIds, profilePic } = req.body;
-        if (!name) return res.status(400).json({ error: 'Kanal adı gerekli' });
-        const myId   = req.user.id;
-        const allIds = [...new Set([myId, ...(Array.isArray(memberIds) ? memberIds : [])])];
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-            const convId = uuidv4();
-            await client.query(
-                `INSERT INTO chatsee_conversations (id, type, name, created_by, profile_pic) VALUES ($1,'group',$2,$3,$4)`,
-                [convId, name, myId, profilePic || null]
-            );
-            for (const uid of allIds) {
-                await client.query(
-                    `INSERT INTO chatsee_members (conversation_id, user_id, is_admin) VALUES ($1,$2,$3)`,
-                    [convId, uid, uid === myId]
-                );
-            }
-            await client.query('COMMIT');
-            res.status(201).json({ id: convId, conversationId: convId, name, members: allIds.length });
-        } catch (err) {
-            await client.query('ROLLBACK');
-            throw err;
-        } finally { client.release(); }
-    } catch (e) { console.error('[channels create]', e.message); res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// GET /api/channels — Kanalları listele
-app.get('/api/channels', authenticateToken, async (req, res) => {
-    try {
-        const { rows } = await pool.query(`
-            SELECT c.id, c.name, c.type, c.profile_pic as "profilePic", c.created_by as "createdBy",
-                   c."createdAt",
-                   (SELECT COUNT(*) FROM chatsee_members WHERE conversation_id=c.id) as "memberCount",
-                   (SELECT content FROM chatsee_messages WHERE conversation_id=c.id ORDER BY "createdAt" DESC LIMIT 1) as "lastMessage",
-                   (SELECT "createdAt" FROM chatsee_messages WHERE conversation_id=c.id ORDER BY "createdAt" DESC LIMIT 1) as "lastMessageAt"
-            FROM chatsee_conversations c
-            JOIN chatsee_members m ON m.conversation_id=c.id AND m.user_id=$1
-            WHERE c.type='group'
-            ORDER BY COALESCE(
-                (SELECT "createdAt" FROM chatsee_messages WHERE conversation_id=c.id ORDER BY "createdAt" DESC LIMIT 1),
-                c."createdAt"
-            ) DESC
-        `, [req.user.id]);
-        res.json({ channels: rows });
-    } catch (e) { console.error('[channels list]', e.message); res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// GET /api/channels/:id/messages — Kanal mesajlarını getir
-app.get('/api/channels/:id/messages', authenticateToken, async (req, res) => {
-    try {
-        const convId = req.params.id;
-        const limit  = Math.min(parseInt(req.query.limit) || 50, 100);
-        const mem = await pool.query(`SELECT 1 FROM chatsee_members WHERE conversation_id=$1 AND user_id=$2`, [convId, req.user.id]);
-        if (!mem.rows.length) return res.status(403).json({ error: 'Erişim yok' });
-
-        const { rows } = await pool.query(`
-            SELECT m.id, m.content, m."senderId", m."createdAt", m."updatedAt",
-                   m."isEdited", m."isDeleted", m."mediaUrl", m."mediaType",
-                   u.name as "senderName", u.username as "senderUsername", u."profilePic" as "senderProfilePic"
-            FROM chatsee_messages m
-            JOIN users u ON u.id=m."senderId"
-            WHERE m.conversation_id=$1
-            ORDER BY m."createdAt" ASC
-            LIMIT $2
-        `, [convId, limit]);
-        res.json({ messages: rows });
-    } catch (e) { console.error('[channels messages]', e.message); res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// POST /api/channels/:id/messages — Mesaj gönder
-app.post('/api/channels/:id/messages', authenticateToken, async (req, res) => {
-    try {
-        const convId  = req.params.id;
-        const { content, mediaUrl, mediaType } = req.body;
-        if (!content?.trim() && !mediaUrl) return res.status(400).json({ error: 'İçerik gerekli' });
-
-        const mem = await pool.query(`SELECT 1 FROM chatsee_members WHERE conversation_id=$1 AND user_id=$2`, [convId, req.user.id]);
-        if (!mem.rows.length) return res.status(403).json({ error: 'Erişim yok' });
-
-        const msgId = uuidv4();
-        await pool.query(
-            `INSERT INTO chatsee_messages (id, conversation_id, "senderId", content, "mediaUrl", "mediaType", "createdAt", "updatedAt")
-             VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW())`,
-            [msgId, convId, req.user.id, content?.trim() || '', mediaUrl || null, mediaType || null]
-        );
-
-        // Socket ile diğer üyelere bildir
-        if (io) {
-            const members = await pool.query(`SELECT user_id FROM chatsee_members WHERE conversation_id=$1 AND user_id!=$2`, [convId, req.user.id]);
-            const sender  = await pool.query(`SELECT name, username, "profilePic" FROM users WHERE id=$1`, [req.user.id]);
-            const snd = sender.rows[0] || {};
-            members.rows.forEach(m => {
-                const sockets = onlineUsers?.get(m.user_id);
-                if (sockets) sockets.forEach(sid => io.to(sid).emit('channel_message', {
-                    channelId: convId, id: msgId, content: content?.trim() || '',
-                    senderId: req.user.id, senderName: snd.name, senderUsername: snd.username,
-                    senderProfilePic: snd.profilePic, createdAt: new Date().toISOString()
-                }));
-            });
-        }
-
-        res.status(201).json({ id: msgId, messageId: msgId });
-    } catch (e) { console.error('[channels send]', e.message); res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// PUT /api/channels/:id/messages/:msgId — Mesaj düzenle
-app.put('/api/channels/:id/messages/:msgId', authenticateToken, async (req, res) => {
-    try {
-        const { content } = req.body;
-        await pool.query(
-            `UPDATE chatsee_messages SET content=$1, "isEdited"=TRUE, "updatedAt"=NOW() WHERE id=$2 AND "senderId"=$3`,
-            [content, req.params.msgId, req.user.id]
-        );
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// DELETE /api/channels/:id/messages/:msgId — Mesaj sil
-app.delete('/api/channels/:id/messages/:msgId', authenticateToken, async (req, res) => {
-    try {
-        await pool.query(
-            `UPDATE chatsee_messages SET "isDeleted"=TRUE, content='Bu mesaj silindi', "updatedAt"=NOW() WHERE id=$1 AND "senderId"=$2`,
-            [req.params.msgId, req.user.id]
-        );
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// GET /api/channels/:id/members — Üyeleri listele
-app.get('/api/channels/:id/members', authenticateToken, async (req, res) => {
-    try {
-        const { rows } = await pool.query(`
-            SELECT u.id, u.name, u.username, u."profilePic", u."isOnline", m.is_admin as "isAdmin"
-            FROM chatsee_members m
-            JOIN users u ON u.id=m.user_id
-            WHERE m.conversation_id=$1
-            ORDER BY m.is_admin DESC, u.name
-        `, [req.params.id]);
-        res.json({ members: rows });
-    } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// POST /api/channels/:id/profile-pic — Kanal fotoğrafı güncelle
-app.post('/api/channels/:id/profile-pic', authenticateToken, upload.single('profilePic'), async (req, res) => {
-    try {
-        if (!req.file) return res.status(400).json({ error: 'Dosya gerekli' });
-        const filename = `ch_${uuidv4().slice(0,12)}.webp`;
-        const dest = path.join(postsDir, filename);
-        await sharp(req.file.path).rotate().resize(256,256,{fit:'cover'}).webp({quality:85}).toFile(dest);
-        await fs.unlink(req.file.path).catch(()=>{});
-        const picUrl = `/uploads/posts/${filename}`;
-        await pool.query(`UPDATE chatsee_conversations SET profile_pic=$1 WHERE id=$2`, [picUrl, req.params.id]);
-        res.json({ profilePic: picUrl });
-    } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// DELETE /api/channels/:id — Kanalı sil
-app.delete('/api/channels/:id', authenticateToken, async (req, res) => {
-    try {
-        const mem = await pool.query(`SELECT is_admin FROM chatsee_members WHERE conversation_id=$1 AND user_id=$2`, [req.params.id, req.user.id]);
-        if (!mem.rows.length || !mem.rows[0].is_admin) return res.status(403).json({ error: 'Sadece yönetici silebilir' });
-        await pool.query(`DELETE FROM chatsee_conversations WHERE id=$1`, [req.params.id]);
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// GET /api/channels/:id/messages/:msgId/seen — Görüldü bilgisi
-app.get('/api/channels/:id/messages/:msgId/seen', authenticateToken, async (req, res) => {
-    try {
-        res.json({ seen: [] }); // Basit placeholder
-    } catch (e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-
-
-// ═══════════════════════════════════════════════════════════════════
-// 🔗 OG URL ÖNİZLEME — GET /api/og-preview?url=...
-// ═══════════════════════════════════════════════════════════════════
-const https_module = require('https');
-const http_module  = require('http');
-
-app.get('/api/og-preview', authenticateToken, async (req, res) => {
-    const { url } = req.query;
-    if (!url) return res.status(400).json({ error: 'url parametresi gerekli' });
-
-    let targetUrl;
-    try {
-        targetUrl = new URL(url.startsWith('www.') ? 'https://' + url : url);
-        if (!['http:', 'https:'].includes(targetUrl.protocol)) return res.status(400).json({ error: 'Geçersiz URL' });
-    } catch(e) {
-        return res.status(400).json({ error: 'Geçersiz URL formatı' });
-    }
-
-    try {
-        const html = await new Promise((resolve, reject) => {
-            const mod = targetUrl.protocol === 'https:' ? https_module : http_module;
-            const opts = {
-                hostname: targetUrl.hostname,
-                path: targetUrl.pathname + targetUrl.search,
-                port: targetUrl.port || (targetUrl.protocol === 'https:' ? 443 : 80),
-                method: 'GET',
-                timeout: 6000,
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (compatible; AgroSosyal/1.0; +https://sehitumitkestitarimmtal.com)',
-                    'Accept': 'text/html,application/xhtml+xml',
-                    'Accept-Language': 'tr,en;q=0.5',
-                }
-            };
-            const req2 = mod.request(opts, r => {
-                if (r.statusCode >= 300 && r.statusCode < 400 && r.headers.location) {
-                    // Basit redirect takibi (1 adım)
-                    return resolve('');
-                }
-                let body = '';
-                r.setEncoding('utf8');
-                r.on('data', chunk => { body += chunk; if (body.length > 200000) { req2.destroy(); resolve(body); } });
-                r.on('end', () => resolve(body));
-                r.on('error', reject);
-            });
-            req2.on('timeout', () => { req2.destroy(); reject(new Error('Timeout')); });
-            req2.on('error', reject);
-            req2.end();
-        });
-
-        // Meta tag parser
-        const getMeta = (property) => {
-            const patterns = [
-                new RegExp(`<meta[^>]+property=["']${property}["'][^>]+content=["']([^"']*?)["']`, 'i'),
-                new RegExp(`<meta[^>]+content=["']([^"']*?)["'][^>]+property=["']${property}["']`, 'i'),
-                new RegExp(`<meta[^>]+name=["']${property}["'][^>]+content=["']([^"']*?)["']`, 'i'),
-                new RegExp(`<meta[^>]+content=["']([^"']*?)["'][^>]+name=["']${property}["']`, 'i'),
-            ];
-            for (const p of patterns) {
-                const m = html.match(p);
-                if (m && m[1]) return m[1].trim().replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&#39;/g,"'").replace(/&quot;/g,'"');
-            }
-            return '';
-        };
-
-        const titleMatch = html.match(/<title[^>]*>([^<]{1,200})<\/title>/i);
-        const title       = getMeta('og:title') || getMeta('twitter:title') || (titleMatch?.[1]?.trim() || '');
-        const description = getMeta('og:description') || getMeta('twitter:description') || getMeta('description') || '';
-        const image       = getMeta('og:image') || getMeta('twitter:image') || '';
-        const siteName    = getMeta('og:site_name') || targetUrl.hostname.replace('www.','');
-        const faviconM    = html.match(/<link[^>]+rel=["'](?:shortcut )?icon["'][^>]+href=["']([^"']+)["']/i);
-        const favicon     = faviconM?.[1] ? new URL(faviconM[1], targetUrl.origin).href : `${targetUrl.origin}/favicon.ico`;
-
-        // Güvenli görsel URL (mutlak yap)
-        let safeImage = '';
-        if (image) {
-            try { safeImage = new URL(image, targetUrl.origin).href; } catch(e) { safeImage = ''; }
-        }
-
-        return res.json({
-            url: targetUrl.href,
-            title: title.slice(0, 200),
-            description: description.slice(0, 500),
-            image: safeImage,
-            siteName: siteName.slice(0, 100),
-            favicon,
-        });
-    } catch (e) {
-        // Hata olsa da URL bilgilerini döndür
-        return res.json({
-            url: targetUrl.href,
-            title: targetUrl.hostname.replace('www.',''),
-            description: '',
-            image: '',
-            siteName: targetUrl.hostname.replace('www.',''),
-            favicon: `${targetUrl.origin}/favicon.ico`,
-        });
-    }
-});
-
-// ═══════════════════════════════════════════════════════════════════
-// 📹 ARAMA API'LERİ (REST — Socket.IO ile birlikte çalışır)
-// ═══════════════════════════════════════════════════════════════════
-
-// Aktif çağrıları bellek içinde tut (üretimde Redis kullanın)
-const activeCalls = new Map();
-
-// POST /api/calls/initiate — Arama başlat
-app.post('/api/calls/initiate', authenticateToken, async (req, res) => {
-    try {
-        const { recipientId, type = 'video' } = req.body;
-        if (!recipientId) return res.status(400).json({ error: 'recipientId gerekli' });
-
-        const callId = uuidv4();
-        activeCalls.set(callId, {
-            callId, callerId: req.user.id, recipientId,
-            type, status: 'ringing', createdAt: Date.now()
-        });
-
-        // Socket ile alıcıya bildir
-        if (io) {
-            const caller = await dbGet(`SELECT id, name, username, "profilePic" FROM users WHERE id = $1`, [req.user.id]);
-            const recipientSockets = onlineUsers?.get(recipientId);
-            if (recipientSockets) {
-                recipientSockets.forEach(sid => {
-                    io.to(sid).emit('incoming_call', {
-                        callId, type,
-                        caller: {
-                            id: caller?.id, name: caller?.name,
-                            username: caller?.username,
-                            profilePic: caller?.profilePic ? absoluteUrl(caller.profilePic) : ''
-                        }
-                    });
-                });
-            }
-        }
-
-        res.json({ callId, status: 'ringing' });
-    } catch(e) {
-        console.error('[Call initiate]', e);
-        res.status(500).json({ error: 'Arama başlatılamadı' });
-    }
-});
-
-// POST /api/calls/respond — Aramayı yanıtla
-app.post('/api/calls/respond', authenticateToken, async (req, res) => {
-    try {
-        const { callId, response } = req.body; // response: 'accept' | 'reject'
-        const call = activeCalls.get(callId);
-        if (!call) return res.status(404).json({ error: 'Arama bulunamadı' });
-
-        call.status = response === 'accept' ? 'active' : 'rejected';
-
-        if (io) {
-            const callerSockets = onlineUsers?.get(call.callerId);
-            const event = response === 'accept' ? 'call_accepted' : 'call_rejected';
-            if (callerSockets) callerSockets.forEach(sid => io.to(sid).emit(event, { callId }));
-        }
-
-        if (response === 'reject') activeCalls.delete(callId);
-        res.json({ success: true, callId, status: call.status });
-    } catch(e) {
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// POST /api/calls/end — Aramayı sonlandır
-app.post('/api/calls/end', authenticateToken, async (req, res) => {
-    try {
-        const { callId } = req.body;
-        const call = activeCalls.get(callId);
-        if (call) {
-            if (io) {
-                const otherId = call.callerId === req.user.id ? call.recipientId : call.callerId;
-                const otherSockets = onlineUsers?.get(otherId);
-                if (otherSockets) otherSockets.forEach(sid => io.to(sid).emit('call_ended', { callId }));
-            }
-            activeCalls.delete(callId);
-        }
-        res.json({ success: true });
-    } catch(e) {
-        res.status(500).json({ error: 'Sunucu hatası' });
-    }
-});
-
-// POST /api/calls/signal/offer — WebRTC offer ilet
-app.post('/api/calls/signal/offer', authenticateToken, async (req, res) => {
-    try {
-        const { callId, offer } = req.body;
-        const call = activeCalls.get(callId);
-        if (!call) return res.status(404).json({ error: 'Arama bulunamadı' });
-        const recipientId = call.callerId === req.user.id ? call.recipientId : call.callerId;
-        if (io) {
-            const sockets = onlineUsers?.get(recipientId);
-            if (sockets) sockets.forEach(sid => io.to(sid).emit('webrtc_offer', { callId, callerId: req.user.id, offer }));
-        }
-        res.json({ success: true });
-    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// POST /api/calls/signal/answer — WebRTC answer ilet
-app.post('/api/calls/signal/answer', authenticateToken, async (req, res) => {
-    try {
-        const { callId, answer } = req.body;
-        const call = activeCalls.get(callId);
-        if (!call) return res.status(404).json({ error: 'Arama bulunamadı' });
-        const callerId = call.callerId;
-        if (io) {
-            const sockets = onlineUsers?.get(callerId);
-            if (sockets) sockets.forEach(sid => io.to(sid).emit('webrtc_answer', { callId, answer }));
-        }
-        res.json({ success: true });
-    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// POST /api/calls/signal/ice — ICE candidate ilet
-app.post('/api/calls/signal/ice', authenticateToken, async (req, res) => {
-    try {
-        const { callId, candidate } = req.body;
-        const call = activeCalls.get(callId);
-        if (!call) return res.status(404).json({ error: 'Arama bulunamadı' });
-        const otherId = call.callerId === req.user.id ? call.recipientId : call.callerId;
-        if (io) {
-            const sockets = onlineUsers?.get(otherId);
-            if (sockets) sockets.forEach(sid => io.to(sid).emit('webrtc_ice_candidate', { callId, candidate }));
-        }
-        res.json({ success: true });
-    } catch(e) { res.status(500).json({ error: 'Sunucu hatası' }); }
-});
-
-// Eski/takılmış aramaları temizle (5 dakikadan uzun "ringing" durumundakiler)
-setInterval(() => {
-    const now = Date.now();
-    activeCalls.forEach((call, callId) => {
-        if (call.status === 'ringing' && (now - call.createdAt) > 5 * 60 * 1000) {
-            activeCalls.delete(callId);
-        }
-    });
-}, 60 * 1000);
-
-// ─── Keşfet geçmişini temizle (saatte bir — 24 saatten eski kayıtlar)
-setInterval(() => {
-    dbRun(`DELETE FROM explore_seen_posts WHERE "seenAt" < NOW() - INTERVAL '24 hours'`, [])
-        .catch(e => console.error('Explore seen temizleme hatası:', e.message));
-}, 60 * 60 * 1000); // Her saat
-
-// ════════════════════════════════════════════════════════════════════
-// 🔒 GÜVENLİK: Admin API rotaları tamamen kapatıldı
-// Bu rotalar artık kullanılmıyor — herhangi bir /api/admin/* isteği
-// anında 404 döner ve saldırı olarak loglanır
-// ════════════════════════════════════════════════════════════════════
 app.all('/api/admin/*', (req, res) => {
     return setTimeout(() => res.status(404).json({ error: 'Sayfa bulunamadı' }), 1000);
 });
@@ -15476,8 +15232,7 @@ app.get('*', (req, res, next) => {
         p.startsWith('/api/')     ||
         p.startsWith('/uploads/') ||
         p.startsWith('/agrolink') ||
-        p.startsWith('/agro-hava')||
-        p.startsWith('/chatsee')
+        p.startsWith('/agro-hava')
     ) return next();
 
     // public/<appname>/ alt-klasörü var mı? Onu sub-app router zaten handle etti
@@ -15520,15 +15275,9 @@ app.use((err, req, res, next) => {
 
 // ==================== SUNUCU BAŞLAT ====================
 
-const NUM_WORKERS = process.env.WEB_CONCURRENCY || Math.min(os.cpus().length, 4);
-
 if (cluster.isPrimary || cluster.isMaster) {
     console.log(`🚀 Master process ${process.pid} - ${NUM_WORKERS} worker başlatılıyor...`);
-
-    for (let i = 0; i < NUM_WORKERS; i++) {
-        cluster.fork();
-    }
-
+    for (let i = 0; i < NUM_WORKERS; i++) { cluster.fork(); }
     cluster.on('exit', (worker, code) => {
         console.log(`⚠️ Worker ${worker.process.pid} kapandı (code: ${code}). Yeniden başlatılıyor...`);
         cluster.fork();
@@ -15536,10 +15285,9 @@ if (cluster.isPrimary || cluster.isMaster) {
 } else {
     (async () => {
         try {
-            await initializeDatabase();
-            await migrateEncryptSensitiveColumns(); // 🔒 Hassas kolonları şifrele (ör: email, mesajlar)
-            await runSQLiteMigration(); // SQLite → PG geçişi (sadece SQLITE_MIGRATE=true ise çalışır)
-            testEmailConnection().catch(() => {}); // E-posta bağlantısını arka planda test et
+            await migrateEncryptSensitiveColumns();
+            await runSQLiteMigration();
+            testEmailConnection().catch(() => {});
             server.listen(PORT, '0.0.0.0', async () => {
                 console.log(`
 ╔══════════════════════════════════════════════════╗
@@ -15557,9 +15305,6 @@ if (cluster.isPrimary || cluster.isMaster) {
 ║  🔥 1000+ Eşzamanlı İstek Desteği               ║
 ╚══════════════════════════════════════════════════╝
                 `);
-
-                // ── 📲 SUNUCU BAŞLANGIÇ TEST BİLDİRİMİ ──────────────────
-                // Başlangıç bildirimi kaldırıldı — sunucu yeniden başlatıldığında bildirim gönderilmez
             });
         } catch (error) {
             console.error('❌ Sunucu başlatılamadı:', error);
@@ -15569,26 +15314,7 @@ if (cluster.isPrimary || cluster.isMaster) {
 }
 
 // Graceful shutdown
-process.on('SIGINT', async () => {
-    console.log('\n🛑 Sunucu kapatılıyor...');
-    await pool.end();
-    process.exit(0);
-});
-
-process.on('SIGTERM', async () => {
-    console.log('\n🛑 Sunucu kapatılıyor...');
-    await pool.end();
-    process.exit(0);
-});
-
-// 🔒 İşlenmeyen hataları yakala — stack trace dışarı sızmasın
-process.on('unhandledRejection', (reason) => {
-    // Sadece sunucu loguna yaz, istemciye gönderme
-    console.error('[UnhandledRejection]', reason?.message || String(reason));
-});
-
-process.on('uncaughtException', (error) => {
-    console.error('[UncaughtException]', error.message);
-    // Kritik hata → çalışmaya devam etme
-    process.exit(1);
-});
+process.on('SIGINT', async () => { console.log('\n🛑 Sunucu kapatılıyor...'); await pool.end(); process.exit(0); });
+process.on('SIGTERM', async () => { console.log('\n🛑 Sunucu kapatılıyor...'); await pool.end(); process.exit(0); });
+process.on('unhandledRejection', (reason) => { console.error('[UnhandledRejection]', reason?.message || String(reason)); });
+process.on('uncaughtException', (error) => { console.error('[UncaughtException]', error.message); process.exit(1); });
